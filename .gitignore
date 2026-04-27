@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+venv/
+
+# Database — runtime file, not source
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Private keys — never commit
+*.key
+
+# OS / editor
+.DS_Store
+*.swp

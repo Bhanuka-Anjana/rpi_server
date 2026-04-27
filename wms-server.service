@@ -1,0 +1,29 @@
+# wms-server.service — systemd unit for WMS Local Server
+#
+# Install on RPi:
+#   sudo cp wms-server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable wms-server
+#   sudo systemctl start wms-server
+#
+# Logs:
+#   journalctl -u wms-server -f
+
+[Unit]
+Description=WMS Local Gateway Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wmsserver
+WorkingDirectory=/home/wmsserver/Desktop/rpi_server
+ExecStart=/home/wmsserver/Desktop/rpi_server/venv/bin/python main.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wms-server
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WMS — Local Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <h1>WMS — Wander Management System</h1>
+    <div id="status-bar">
+      <span id="stat-anchors">Anchors: —</span>
+      <span id="stat-tags">Active Tags: —</span>
+      <span id="conn-status" class="badge offline">Connecting…</span>
+    </div>
+  </header>
+
+  <nav>
+    <button class="tab-btn active" data-tab="tags">Tags</button>
+    <button class="tab-btn" data-tab="doors">Doors</button>
+    <button class="tab-btn" data-tab="alerts">Alerts</button>
+    <button class="tab-btn" data-tab="events">Event Log</button>
+    <button class="tab-btn" data-tab="firmware">Firmware</button>
+  </nav>
+
+  <!-- Tags Tab -->
+  <section id="tab-tags" class="tab active">
+    <h2>Live Tag Status</h2>
+    <table id="tag-table">
+      <thead>
+        <tr>
+          <th>Tag UID</th>
+          <th>Nearest Anchor</th>
+          <th>Distance (cm)</th>
+          <th>Gear</th>
+          <th>Escort</th>
+          <th>Last Seen</th>
+        </tr>
+      </thead>
+      <tbody id="tag-tbody"></tbody>
+    </table>
+  </section>
+
+  <!-- Doors Tab -->
+  <section id="tab-doors" class="tab">
+    <h2>Door Status</h2>
+    <div id="door-cards"></div>
+  </section>
+
+  <!-- Alerts Tab -->
+  <section id="tab-alerts" class="tab">
+    <h2>Alerts</h2>
+    <table id="alert-table">
+      <thead>
+        <tr><th>Time</th><th>Anchor</th><th>Type</th><th>Tag</th><th>Details</th></tr>
+      </thead>
+      <tbody id="alert-tbody"></tbody>
+    </table>
+  </section>
+
+  <!-- Event Log Tab -->
+  <section id="tab-events" class="tab">
+    <h2>Event Log</h2>
+    <div class="toolbar">
+      <input id="filter-input" type="text" placeholder="Filter by type or anchor…" />
+    </div>
+    <table id="event-table">
+      <thead>
+        <tr><th>Time</th><th>Anchor</th><th>Type</th><th>Tag</th><th>Dist (cm)</th></tr>
+      </thead>
+      <tbody id="event-tbody"></tbody>
+    </table>
+  </section>
+
+  <!-- Firmware Tab -->
+  <section id="tab-firmware" class="tab">
+    <h2>Firmware Management</h2>
+    <div id="fw-upload-area">
+      <input type="text" id="fw-version-input" placeholder="Version label (e.g. v2.1.0)" />
+      <input type="file" id="fw-file-input" accept=".bin" />
+      <button id="fw-upload-btn">Upload</button>
+      <span id="fw-upload-status"></span>
+    </div>
+    <table id="fw-table">
+      <thead>
+        <tr>
+          <th>Version</th><th>Filename</th><th>Size</th>
+          <th>SHA256</th><th>Uploaded</th><th></th>
+        </tr>
+      </thead>
+      <tbody id="fw-tbody"></tbody>
+    </table>
+  </section>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
