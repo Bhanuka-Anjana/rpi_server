@@ -43,11 +43,12 @@ def _load_ca(pki_dir: str):
 
 def generate_anchor_cert(anchor_id: int, pki_dir: str) -> dict:
     """
-    Generate an EC P-256 anchor certificate (CN=anchor_id), signed by the site CA.
-    Registers the cert serial in the DB immediately so concurrent calls to
-    next_available_anchor_id() see this anchor_id as taken.
+    Generate an EC P-256 anchor certificate (CN=EUI-64 hex), signed by the site CA.
+    Registers the cert serial in the DB immediately so concurrent bootstrap handlers
+    can detect the anchor_id as taken.
 
-    anchor_id=0 is reserved for the shared bootstrap cert (factory-fresh devices).
+    anchor_id must be the EUI-64 numeric value (uint64).  anchor_id=0 is reserved
+    for the shared bootstrap cert (factory-fresh devices, CN='0').
 
     Returns:
         {
@@ -61,9 +62,12 @@ def generate_anchor_cert(anchor_id: int, pki_dir: str) -> dict:
     now = datetime.now(timezone.utc)
 
     anchor_key  = ec.generate_private_key(ec.SECP256R1())
+    # CN = 16-char uppercase hex of EUI-64 (e.g. "A4C138FFFEAABBCC").
+    # Bootstrap cert (anchor_id=0) keeps CN='0' as the sentinel.
+    cn_str = "0" if anchor_id == 0 else f"{anchor_id:016X}"
     anchor_name = x509.Name([
         x509.NameAttribute(NameOID.ORGANIZATION_NAME, "WMS"),
-        x509.NameAttribute(NameOID.COMMON_NAME, str(anchor_id)),
+        x509.NameAttribute(NameOID.COMMON_NAME, cn_str),
     ])
 
     serial = x509.random_serial_number()
@@ -104,8 +108,8 @@ def generate_anchor_cert(anchor_id: int, pki_dir: str) -> dict:
         encryption_algorithm=serialization.NoEncryption(),
     ).decode()
 
-    # Register in DB immediately — next_available_anchor_id() queries anchor_certs,
-    # so this makes the ID visible to concurrent bootstrap handlers.
+    # Register in DB immediately so concurrent bootstrap handlers can detect
+    # this anchor_id as already provisioned (cert serial in anchor_certs).
     db.register_anchor_cert(anchor_id, serial_hex)
 
     return {

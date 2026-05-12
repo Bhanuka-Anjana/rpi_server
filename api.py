@@ -122,7 +122,8 @@ async def remove_anchor(anchor_id: int):
     deregister_anchor() deletes the cert ledger rows (unknown serial → revoked)."""
     db.deregister_anchor(anchor_id)
     await tcp_server.kick_anchor(anchor_id)
-    broadcast_event({"type": "_anchor_removed", "anchor_id": anchor_id})
+    broadcast_event({"type": "_anchor_removed", "anchor_id": anchor_id,
+                     "anchor_id_str": str(anchor_id)})
     return {"status": "removed", "anchor_id": anchor_id}
 
 
@@ -170,7 +171,8 @@ async def start_ota(anchor_id: int, fw_id: int):
         "sha256":  fw["sha256"],
         "size":    fw["size_bytes"],
     })
-    broadcast_event({"type": "OTA_PROGRESS", "anchor_id": anchor_id, "percent": 0,
+    broadcast_event({"type": "OTA_PROGRESS", "anchor_id": anchor_id,
+                     "anchor_id_str": str(anchor_id), "percent": 0,
                      "ts_ms": int(time.time() * 1000)})
     return {"status": "pushed", "anchor_id": anchor_id, "url": url}
 

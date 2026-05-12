@@ -8,6 +8,21 @@ from config import DB_PATH
 
 _lock = threading.Lock()
 
+# SQLite INTEGER is signed 64-bit; EUI-64 values with the high bit set exceed
+# the max (2^63-1).  Store as signed int64 (two's complement) and convert back
+# on every read.
+def _to_db(n: int) -> int:
+    return n if n <= 0x7FFFFFFFFFFFFFFF else n - 0x10000000000000000
+
+def _from_db(n: int) -> int:
+    return n if n >= 0 else n + 0x10000000000000000
+
+def _fix_row(d: dict) -> dict:
+    for key in ("anchor_id", "nearest_anchor"):
+        if key in d and d[key] is not None:
+            d[key] = _from_db(d[key])
+    return d
+
 
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -123,6 +138,8 @@ def init_db():
             "ALTER TABLE anchors ADD COLUMN fw_version  TEXT    DEFAULT NULL",
             "ALTER TABLE anchors ADD COLUMN ota_status  TEXT    DEFAULT 'IDLE'",
             "ALTER TABLE anchors ADD COLUMN ota_percent INTEGER DEFAULT 0",
+            # EUI-64 hex string column (display / search) — anchor_id IS the EUI numeric value
+            "ALTER TABLE anchors ADD COLUMN eui TEXT DEFAULT NULL",
         ]:
             try:
                 c.execute(migration)
@@ -144,7 +161,7 @@ def insert_event(evt: dict) -> int:
             VALUES (?, ?, ?, ?, ?, ?)
         """, (
             evt.get("ts_ms", int(time.time() * 1000)),
-            evt.get("anchor_id", 0),
+            _to_db(evt.get("anchor_id", 0)),
             evt.get("type", "UNKNOWN"),
             evt.get("tag_uid"),
             evt.get("dist_cm"),
@@ -157,20 +174,24 @@ def insert_event(evt: dict) -> int:
 
 
 def upsert_anchor(anchor_id: int, anchor_type: int = None, boot_count: int = None):
+    """Insert or update anchor row.  anchor_id is the EUI-64 numeric value."""
+    eui_hex = f"{anchor_id:016X}"  # always keep eui column in sync
+    db_id = _to_db(anchor_id)
     with _lock:
         conn = get_conn()
         conn.execute("""
-            INSERT INTO anchors (anchor_id, anchor_type, last_heartbeat_ms, online)
-            VALUES (?, ?, ?, 1)
+            INSERT INTO anchors (anchor_id, eui, anchor_type, last_heartbeat_ms, online)
+            VALUES (?, ?, ?, ?, 1)
             ON CONFLICT(anchor_id) DO UPDATE SET
                 last_heartbeat_ms = excluded.last_heartbeat_ms,
                 online = 1,
+                eui    = excluded.eui,
                 anchor_type = COALESCE(excluded.anchor_type, anchor_type)
-        """, (anchor_id, anchor_type, int(time.time() * 1000)))
+        """, (db_id, eui_hex, anchor_type, int(time.time() * 1000)))
         if boot_count is not None:
             conn.execute(
                 "UPDATE anchors SET boot_count = ? WHERE anchor_id = ?",
-                (boot_count, anchor_id)
+                (boot_count, db_id)
             )
         conn.commit()
         conn.close()
@@ -189,7 +210,7 @@ def upsert_tag_state(uid: int, anchor_id: int, dist_cm: int,
                 gear           = COALESCE(excluded.gear, gear),
                 escort         = excluded.escort,
                 last_seen_ms   = excluded.last_seen_ms
-        """, (uid, anchor_id, dist_cm, gear, escort, int(time.time() * 1000)))
+        """, (uid, _to_db(anchor_id), dist_cm, gear, escort, int(time.time() * 1000)))
         conn.commit()
         conn.close()
 
@@ -197,6 +218,7 @@ def upsert_tag_state(uid: int, anchor_id: int, dist_cm: int,
 def upsert_door_state(anchor_id: int, **kwargs):
     with _lock:
         conn = get_conn()
+        db_id = _to_db(anchor_id)
         # Build dynamic SET clause from kwargs
         fields = {k: v for k, v in kwargs.items()
                   if k in ("locked", "fire", "rex", "ajar")}
@@ -206,12 +228,12 @@ def upsert_door_state(anchor_id: int, **kwargs):
             INSERT INTO door_state (anchor_id, locked, fire, rex, ajar, ts_ms)
             VALUES (?, 0, 0, 0, 0, ?)
             ON CONFLICT(anchor_id) DO NOTHING
-        """, (anchor_id, fields["ts_ms"]))
+        """, (db_id, fields["ts_ms"]))
 
         for col, val in fields.items():
             conn.execute(
                 f"UPDATE door_state SET {col} = ? WHERE anchor_id = ?",
-                (val, anchor_id)
+                (val, db_id)
             )
         conn.commit()
         conn.close()
@@ -233,25 +255,33 @@ def get_unsent_events(limit: int = 50) -> list:
             (limit,)
         ).fetchall()
         conn.close()
-        return [dict(r) for r in rows]
+        return [_fix_row(dict(r)) for r in rows]
 
 
 def get_recent_events(limit: int = 100) -> list:
     with _lock:
         conn = get_conn()
         rows = conn.execute(
-            "SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)
+            """SELECT e.*, a.eui
+               FROM events e
+               LEFT JOIN anchors a ON e.anchor_id = a.anchor_id
+               ORDER BY e.id DESC LIMIT ?""", (limit,)
         ).fetchall()
         conn.close()
-        return [dict(r) for r in rows]
+        return [_fix_row(dict(r)) for r in rows]
 
 
 def get_all_tags() -> list:
     with _lock:
         conn = get_conn()
-        rows = conn.execute("SELECT * FROM tag_state ORDER BY last_seen_ms DESC").fetchall()
+        rows = conn.execute("""
+            SELECT t.*, a.eui AS nearest_anchor_eui
+            FROM tag_state t
+            LEFT JOIN anchors a ON t.nearest_anchor = a.anchor_id
+            ORDER BY t.last_seen_ms DESC
+        """).fetchall()
         conn.close()
-        return [dict(r) for r in rows]
+        return [_fix_row(dict(r)) for r in rows]
 
 
 def get_all_anchors() -> list:
@@ -270,7 +300,13 @@ def get_all_anchors() -> list:
             ORDER BY a.anchor_id
         """).fetchall()
         conn.close()
-        return [dict(r) for r in rows]
+        result = [_fix_row(dict(r)) for r in rows]
+        # anchor_id is a 64-bit EUI that exceeds JS Number.MAX_SAFE_INTEGER.
+        # Expose it as a string so data-anchor-id attributes carry the exact value
+        # and API DELETE/config calls reach the correct DB row.
+        for row in result:
+            row["anchor_id_str"] = str(row["anchor_id"])
+        return result
 
 
 # ── Config parameter bounds ────────────────────────────────────────────
@@ -367,19 +403,20 @@ def _decode_config_row(row) -> dict:
 
 def get_anchor_config(anchor_id: int) -> dict:
     """Return config for anchor, inserting defaults if not present."""
+    db_id = _to_db(anchor_id)
     with _lock:
         conn = get_conn()
         row = conn.execute(
-            "SELECT * FROM anchor_config WHERE anchor_id = ?", (anchor_id,)
+            "SELECT * FROM anchor_config WHERE anchor_id = ?", (db_id,)
         ).fetchone()
         if not row:
             conn.execute(
                 "INSERT OR IGNORE INTO anchor_config (anchor_id, updated_ms) VALUES (?, ?)",
-                (anchor_id, int(time.time() * 1000))
+                (db_id, int(time.time() * 1000))
             )
             conn.commit()
             row = conn.execute(
-                "SELECT * FROM anchor_config WHERE anchor_id = ?", (anchor_id,)
+                "SELECT * FROM anchor_config WHERE anchor_id = ?", (db_id,)
             ).fetchone()
         conn.close()
         return _decode_config_row(row)
@@ -390,22 +427,23 @@ def upsert_anchor_config(anchor_id: int, params: dict) -> dict:
     safe = _clamp_config(params)
     if not safe:
         return get_anchor_config(anchor_id)
+    db_id = _to_db(anchor_id)
     with _lock:
         conn = get_conn()
         conn.execute(
             "INSERT OR IGNORE INTO anchor_config (anchor_id, updated_ms) VALUES (?, ?)",
-            (anchor_id, int(time.time() * 1000))
+            (db_id, int(time.time() * 1000))
         )
         for col, val in safe.items():
             # wifi_networks is a Python list — serialise to JSON for SQLite storage
             db_val = json.dumps(val) if isinstance(val, list) else val
             conn.execute(
                 f"UPDATE anchor_config SET {col} = ? WHERE anchor_id = ?",
-                (db_val, anchor_id)
+                (db_val, db_id)
             )
         conn.execute(
             "UPDATE anchor_config SET config_status = 'PENDING', updated_ms = ? WHERE anchor_id = ?",
-            (int(time.time() * 1000), anchor_id)
+            (int(time.time() * 1000), db_id)
         )
         conn.commit()
         conn.close()
@@ -417,7 +455,7 @@ def mark_config_applied(anchor_id: int):
         conn = get_conn()
         conn.execute(
             "UPDATE anchor_config SET config_status = 'APPLIED' WHERE anchor_id = ?",
-            (anchor_id,)
+            (_to_db(anchor_id),)
         )
         conn.commit()
         conn.close()
@@ -428,7 +466,7 @@ def mark_config_failed(anchor_id: int):
         conn = get_conn()
         conn.execute(
             "UPDATE anchor_config SET config_status = 'FAILED' WHERE anchor_id = ?",
-            (anchor_id,)
+            (_to_db(anchor_id),)
         )
         conn.commit()
         conn.close()
@@ -441,7 +479,7 @@ def get_pending_configs() -> list:
             "SELECT * FROM anchor_config WHERE config_status = 'PENDING'"
         ).fetchall()
         conn.close()
-        return [_decode_config_row(r) for r in rows]
+        return [_fix_row(_decode_config_row(r)) for r in rows]
 
 
 # ── Anchor certificate ledger (mTLS revocation) ───────────────────────
@@ -453,7 +491,7 @@ def register_anchor_cert(anchor_id: int, serial_hex: str):
         conn.execute("""
             INSERT OR REPLACE INTO anchor_certs (serial_hex, anchor_id, issued_ms, revoked)
             VALUES (?, ?, ?, 0)
-        """, (serial_hex.upper(), anchor_id, int(time.time() * 1000)))
+        """, (serial_hex.upper(), _to_db(anchor_id), int(time.time() * 1000)))
         conn.commit()
         conn.close()
 
@@ -484,49 +522,23 @@ def revoke_anchor_cert(serial_hex: str):
         conn.close()
 
 
-def next_available_anchor_id() -> int:
-    """Return the lowest unused positive anchor_id.
-
-    Queries anchor_certs (not anchors) so that IDs claimed during the current
-    bootstrap session are visible immediately — before the anchor's first
-    heartbeat inserts a row into anchors.  Safe under asyncio's single-threaded
-    model because generate_anchor_cert() inserts into anchor_certs synchronously
-    before returning, with no await between the query and the insert.
-
-    After a factory reset deregister_anchor() deletes the cert rows, so the
-    freed ID will appear as a gap and be reused by the next device.
-    """
-    with _lock:
-        conn = get_conn()
-        rows = conn.execute(
-            "SELECT DISTINCT anchor_id FROM anchor_certs WHERE anchor_id > 0"
-        ).fetchall()
-        conn.close()
-    used = {row[0] for row in rows}
-    n = 1
-    while n in used:
-        n += 1
-    return n
-
-
 def deregister_anchor(anchor_id: int):
     """Delete all records for an anchor after a factory reset.
 
     Called when a FACTORY_RESET message is received.  The anchor erases its
     NVS and reboots with CN=0 (bootstrap cert), which triggers zero-touch
-    re-provisioning.  Deleting the cert rows (not just revoking them) makes
-    the anchor_id immediately available to next_available_anchor_id() so the
-    next provisioned device can reuse it.
+    re-provisioning using its EUI-64 sent in the HELLO message.
 
     Events are kept as an audit trail — they reference anchor_id but are
     never deleted.
     """
+    db_id = _to_db(anchor_id)
     with _lock:
         conn = get_conn()
-        conn.execute("DELETE FROM anchor_certs  WHERE anchor_id = ?", (anchor_id,))
-        conn.execute("DELETE FROM anchors        WHERE anchor_id = ?", (anchor_id,))
-        conn.execute("DELETE FROM door_state     WHERE anchor_id = ?", (anchor_id,))
-        conn.execute("DELETE FROM anchor_config  WHERE anchor_id = ?", (anchor_id,))
+        conn.execute("DELETE FROM anchor_certs  WHERE anchor_id = ?", (db_id,))
+        conn.execute("DELETE FROM anchors        WHERE anchor_id = ?", (db_id,))
+        conn.execute("DELETE FROM door_state     WHERE anchor_id = ?", (db_id,))
+        conn.execute("DELETE FROM anchor_config  WHERE anchor_id = ?", (db_id,))
         conn.commit()
         conn.close()
 
@@ -542,7 +554,7 @@ def revoke_other_anchor_certs(anchor_id: int, keep_serial: str):
         conn.execute(
             "UPDATE anchor_certs SET revoked = 1 "
             "WHERE anchor_id = ? AND serial_hex != ? AND revoked = 0",
-            (anchor_id, keep_serial.upper())
+            (_to_db(anchor_id), keep_serial.upper())
         )
         conn.commit()
         conn.close()
@@ -600,7 +612,7 @@ def set_anchor_ota_status(anchor_id: int, status: str, percent: int = 0):
         conn = get_conn()
         conn.execute(
             "UPDATE anchors SET ota_status = ?, ota_percent = ? WHERE anchor_id = ?",
-            (status, percent, anchor_id)
+            (status, percent, _to_db(anchor_id))
         )
         conn.commit()
         conn.close()
@@ -610,7 +622,7 @@ def get_anchor_ota_status(anchor_id: int) -> str:
     with _lock:
         conn = get_conn()
         row = conn.execute(
-            "SELECT ota_status FROM anchors WHERE anchor_id = ?", (anchor_id,)
+            "SELECT ota_status FROM anchors WHERE anchor_id = ?", (_to_db(anchor_id),)
         ).fetchone()
         conn.close()
         return row["ota_status"] if row else "IDLE"
@@ -621,7 +633,7 @@ def set_anchor_fw_version(anchor_id: int, version: str):
         conn = get_conn()
         conn.execute(
             "UPDATE anchors SET fw_version = ? WHERE anchor_id = ?",
-            (version, anchor_id)
+            (version, _to_db(anchor_id))
         )
         conn.commit()
         conn.close()
@@ -635,9 +647,12 @@ def get_alerts(limit: int = 50) -> list:
     with _lock:
         conn = get_conn()
         rows = conn.execute(
-            f"SELECT * FROM events WHERE type IN ({placeholders}) "
-            f"ORDER BY id DESC LIMIT ?",
+            f"""SELECT e.*, a.eui
+                FROM events e
+                LEFT JOIN anchors a ON e.anchor_id = a.anchor_id
+                WHERE e.type IN ({placeholders})
+                ORDER BY e.id DESC LIMIT ?""",
             (*alert_types, limit)
         ).fetchall()
         conn.close()
-        return [dict(r) for r in rows]
+        return [_fix_row(dict(r)) for r in rows]
