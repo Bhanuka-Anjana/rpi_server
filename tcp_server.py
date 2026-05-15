@@ -57,6 +57,58 @@ _tag_last_write: dict[int, float] = {}
 _TAG_DB_INTERVAL = 0.25   # seconds — 4 writes/sec per tag maximum
 
 
+def _parse_eui64(value, *, hex_if_16: bool = False) -> int | None:
+    """Parse an EUI-64 from int, decimal string, or 16-char hex string."""
+    if isinstance(value, bool) or value is None:
+        return None
+
+    try:
+        if isinstance(value, int):
+            eui = value
+        elif isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return None
+            raw = raw.removeprefix("0x").removeprefix("0X")
+            raw = raw.replace(":", "").replace("-", "").replace(" ", "")
+            if not raw:
+                return None
+            is_hex = (hex_if_16 and len(raw) == 16) or any(
+                c in "ABCDEFabcdef" for c in raw
+            )
+            base = 16 if is_hex else 10
+            eui = int(raw, base)
+        else:
+            return None
+    except (TypeError, ValueError):
+        return None
+
+    if 0 < eui <= 0xFFFFFFFFFFFFFFFF:
+        return eui
+    return None
+
+
+def _extract_hello_eui(evt: dict) -> int | None:
+    payload = evt.get("payload")
+    if payload is not None and not isinstance(payload, dict):
+        eui = _parse_eui64(payload, hex_if_16=True)
+        if eui is not None:
+            return eui
+
+    sources = [payload, evt] if isinstance(payload, dict) else [evt]
+
+    for src in sources:
+        for key in ("eui", "eui64", "eui_id", "anchor_eui", "anchor_id", "id"):
+            if key in src:
+                eui = _parse_eui64(
+                    src.get(key),
+                    hex_if_16=key in ("eui", "eui64", "anchor_eui"),
+                )
+                if eui is not None:
+                    return eui
+    return None
+
+
 def set_broadcast_fn(fn):
     """Called by main.py to register the SSE broadcast callback."""
     global _broadcast_fn
@@ -129,10 +181,9 @@ def _extract_anchor_id(writer: asyncio.StreamWriter) -> tuple[int | None, str]:
 
     subject = dict(x[0] for x in cert.get("subject", ()))
     cn = subject.get("commonName", "")
-    try:
-        anchor_id = int(cn)
-    except ValueError:
-        log.warning("[TLS] Rejected peer: CN '%s' is not a numeric anchor ID", cn)
+    anchor_id = 0 if cn == "0" else _parse_eui64(cn, hex_if_16=True)
+    if anchor_id is None:
+        log.warning("[TLS] Rejected peer: CN '%s' is not a valid anchor EUI", cn)
         return None, ""
 
     serial_raw = cert.get("serialNumber", "0")
@@ -224,6 +275,7 @@ def _persist_event(evt: dict):
         cfg = db.get_anchor_config(anchor_id)
         cfg["type"]      = "_config_update"
         cfg["anchor_id"] = anchor_id
+        cfg["anchor_id_str"] = str(anchor_id)
         cfg["ts_ms"]     = evt.get("ts_ms", int(time.time() * 1000))
         return cfg  # caller broadcasts this
 
@@ -332,35 +384,19 @@ async def _handle_anchor(reader: asyncio.StreamReader,
         writer.close()
         return
 
-    # ── Zero-touch bootstrap ───────────────────────────────────────────────
-    if anchor_id_cert == 0:
-        new_id = db.next_available_anchor_id()
-        log.info("[TCP] Bootstrap anchor from %s — assigning anchor_id=%d", peer, new_id)
-        try:
-            cert = pki_utils.generate_anchor_cert(new_id, PKI_DIR)
-        except Exception as e:
-            log.error("[TCP] Bootstrap cert generation failed: %s", e)
-            writer.close()
-            return
-        _anchor_writers[new_id] = writer
-        _pending_reprovisions[new_id] = cert["serial_hex"]
-        await push_command(new_id, {
-            "type":        "REPROVISION",
-            "anchor_id":   new_id,
-            "ca_cert":     cert["ca_cert_pem"],
-            "client_cert": cert["client_cert_pem"],
-            "client_key":  cert["client_key_pem"],
-        })
-        anchor_id_cert = new_id
+    bootstrap_pending = anchor_id_cert == 0
+    if bootstrap_pending:
+        log.info("[TCP] Bootstrap anchor connected from %s — waiting for HELLO EUI",
+                 peer)
+    else:
+        log.info("[TCP] Anchor %d connected from %s (cert serial …%s)",
+                 anchor_id_cert, peer, serial_hex[-8:])
 
-    log.info("[TCP] Anchor %d connected from %s (cert serial …%s)",
-             anchor_id_cert, peer, serial_hex[-8:])
+        _anchor_writers[anchor_id_cert] = writer
 
-    _anchor_writers[anchor_id_cert] = writer
-
-    cfg = db.get_anchor_config(anchor_id_cert)
-    if cfg.get("config_status") == "PENDING":
-        await push_config(anchor_id_cert, cfg)
+        cfg = db.get_anchor_config(anchor_id_cert)
+        if cfg.get("config_status") == "PENDING":
+            await push_config(anchor_id_cert, cfg)
 
     loop   = asyncio.get_running_loop()
     buffer = b""
@@ -379,8 +415,54 @@ async def _handle_anchor(reader: asyncio.StreamReader,
                 try:
                     evt   = json.loads(line.decode("utf-8"))
                     etype = evt.get("type", "")
+                    if bootstrap_pending:
+                        if etype != "HELLO":
+                            log.warning("[TCP] Bootstrap anchor from %s sent %s before HELLO; ignoring",
+                                        peer, etype or "UNKNOWN")
+                            continue
+
+                        hello_eui = _extract_hello_eui(evt)
+                        if hello_eui is None:
+                            log.warning("[TCP] Bootstrap HELLO from %s missing valid EUI — raw: %s",
+                                        peer, line[:120])
+                            writer.close()
+                            return
+
+                        anchor_id_cert = hello_eui
+                        bootstrap_pending = False
+                        _anchor_writers[anchor_id_cert] = writer
+                        log.info("[TCP] Bootstrap HELLO from %s — using EUI %016X (%d)",
+                                 peer, anchor_id_cert, anchor_id_cert)
+
+                        try:
+                            cert = pki_utils.generate_anchor_cert(anchor_id_cert, PKI_DIR)
+                        except Exception as e:
+                            log.error("[TCP] Bootstrap cert generation failed for anchor %d: %s",
+                                      anchor_id_cert, e)
+                            writer.close()
+                            return
+
+                        _pending_reprovisions[anchor_id_cert] = cert["serial_hex"]
+                        await push_command(anchor_id_cert, {
+                            "type":        "REPROVISION",
+                            "anchor_id":   anchor_id_cert,
+                            "ca_cert":     cert["ca_cert_pem"],
+                            "client_cert": cert["client_cert_pem"],
+                            "client_key":  cert["client_key_pem"],
+                        })
+
+                        cfg = db.get_anchor_config(anchor_id_cert)
+                        if cfg.get("config_status") == "PENDING":
+                            await push_config(anchor_id_cert, cfg)
+
+                    if etype == "HELLO":
+                        hello_payload = evt.get("payload", evt)
+                        log.info("[TCP] HELLO from anchor %d via TCP — payload=%s",
+                                 anchor_id_cert,
+                                 json.dumps(hello_payload, separators=(",", ":")))
                     evt["ts_ms"]    = int(time.time() * 1000)
                     evt["anchor_id"] = anchor_id_cert
+                    evt["anchor_id_str"] = str(anchor_id_cert)
 
                     # ── Inline control messages (no broadcast) ─────────────
                     if etype == "TIME_SYNC_REQ":
