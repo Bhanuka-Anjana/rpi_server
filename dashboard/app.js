@@ -355,6 +355,7 @@ function renderTwrDebug() {
 }
 
 function renderRoomMapOnly() {
+  if (roomDrag) return;
   const container = document.getElementById("room-admin");
   if (!container) return;
   const mapPanel = container.querySelector(".room-map-panel");
@@ -362,142 +363,12 @@ function renderRoomMapOnly() {
   if (mapPanel && room) mapPanel.innerHTML = renderRoomMap(room);
 }
 
-function renderRooms() {
-  const container = document.getElementById("room-admin");
-  if (!container) return;
-
-  // Don't clobber inputs the user is actively editing — just refresh the preview.
-  if (container.contains(document.activeElement) &&
-      (document.activeElement.tagName === "INPUT" || document.activeElement.tagName === "SELECT")) {
-    renderRoomPreviewOnly();
-    return;
-  }
-
-  const room = selectedRoom();
-  const roomOptions = rooms.map(r =>
-    `<option value="${r.id}" ${room && r.id === room.id ? "selected" : ""}>${esc(r.name)}</option>`
-  ).join("");
-  const anchorOptions = Object.values(anchors).map(a => {
-    const id = anchorKey(a);
-    const mapped = roomAnchorFor(id);
-    const suffix = mapped ? ` (${mapped.room.name})` : "";
-    return `<option value="${id}">${esc(anchorLabel(a))}${esc(suffix)}</option>`;
-  }).join("");
-
-  const preview = room ? renderRoomPreview(room) : '<div class="room-empty">Create a room to preview anchors and tags.</div>';
-  const mappings = room ? (room.anchors || []) : [];
-
-  container.innerHTML = `
-    <div class="room-grid">
-      <div class="room-panel">
-        <h3>Create Room</h3>
-        <div class="room-form compact">
-          <input id="room-new-name" placeholder="Room name" />
-          <input id="room-new-width" type="number" min="100" placeholder="Width cm" />
-          <input id="room-new-height" type="number" min="100" placeholder="Height cm" />
-          <button id="room-create-btn">Create</button>
-        </div>
-
-        <h3>Selected Room</h3>
-        ${rooms.length ? `
-        <div class="room-form">
-          <select id="room-select">${roomOptions}</select>
-          <input id="room-edit-name" value="${esc(room.name)}" />
-          <input id="room-edit-width" type="number" min="100" value="${room.width_cm}" />
-          <input id="room-edit-height" type="number" min="100" value="${room.height_cm}" />
-          <button id="room-save-btn">Save</button>
-          <button id="room-delete-btn" class="danger">Delete</button>
-        </div>
-
-        <h3>Assign Anchor</h3>
-        <div class="room-form anchor-form">
-          <select id="room-anchor-select">${anchorOptions || '<option value="">No anchors</option>'}</select>
-          <input id="room-anchor-uwb" type="number" min="0" max="65535" placeholder="UWB short ID" />
-          <input id="room-anchor-x" type="number" placeholder="X cm" />
-          <input id="room-anchor-y" type="number" placeholder="Y cm" />
-          <input id="room-anchor-heading" type="number" step="0.1" placeholder="Heading deg" />
-          <input id="room-anchor-radius" type="number" min="1" placeholder="Danger radius" />
-          <label class="room-check"><input id="room-anchor-enabled" type="checkbox" checked /> Lock</label>
-          <button id="room-anchor-save-btn">Assign</button>
-        </div>
-
-        <table class="room-anchor-table">
-          <thead>
-            <tr><th>Anchor</th><th>UWB</th><th>X</th><th>Y</th><th>Heading</th><th>Radius</th><th>Lock</th><th></th></tr>
-          </thead>
-          <tbody>
-            ${mappings.map(a => `
-              <tr data-room-anchor-id="${a.anchor_id_str || a.anchor_id}">
-                <td>${esc(a.eui || anchorDisplayById(a.anchor_id_str || a.anchor_id))}</td>
-                <td><input data-field="uwb_short_id" type="number" min="0" max="65535" value="${numberOrBlank(a.uwb_short_id)}" /></td>
-                <td><input data-field="room_x_cm" type="number" value="${numberOrBlank(a.room_x_cm)}" /></td>
-                <td><input data-field="room_y_cm" type="number" value="${numberOrBlank(a.room_y_cm)}" /></td>
-                <td><input data-field="heading_deg" type="number" step="0.1" value="${numberOrBlank(a.heading_deg)}" /></td>
-                <td><input data-field="danger_radius_cm" type="number" min="1" value="${numberOrBlank(a.danger_radius_cm)}" /></td>
-                <td><input data-field="lock_enabled" type="checkbox" ${a.lock_enabled ? "checked" : ""} /></td>
-                <td>
-                  <button class="room-row-save">Save</button>
-                  <button class="room-row-remove danger">Remove</button>
-                </td>
-              </tr>
-            `).join("") || '<tr><td colspan="8" style="color:#6b7280">No anchors assigned</td></tr>'}
-          </tbody>
-        </table>` : '<p class="room-empty">No rooms configured.</p>'}
-      </div>
-      <div class="room-panel preview-panel">
-        ${preview}
-      </div>
-    </div>
-  `;
-}
-
-function renderRoomPreview(room) {
-  const w = Math.max(1, Number(room.width_cm || 1));
-  const h = Math.max(1, Number(room.height_cm || 1));
-  const anchorsHtml = (room.anchors || []).map(a => {
-    const x = Number(a.room_x_cm || 0);
-    const y = Number(a.room_y_cm || 0);
-    const r = Number(a.danger_radius_cm || 0);
-    return `
-      <div class="danger-zone" style="left:${((x - r) / w) * 100}%;bottom:${((y - r) / h) * 100}%;width:${(2 * r / w) * 100}%;height:${(2 * r / h) * 100}%"></div>
-      <div class="room-anchor-dot" style="left:${(x / w) * 100}%;bottom:${(y / h) * 100}%" title="${esc(a.eui || anchorDisplayById(a.anchor_id_str || a.anchor_id))}">
-        <span>${hex16(a.uwb_short_id)}</span>
-      </div>
-    `;
-  }).join("");
-  const tagsHtml = Object.values(tags).filter(t =>
-    Number(t.room_id) === Number(room.id) &&
-    t.global_x_cm !== undefined && t.global_x_cm !== null &&
-    t.global_y_cm !== undefined && t.global_y_cm !== null
-  ).map(t => `
-    <div class="room-tag-dot" style="left:${(Number(t.global_x_cm) / w) * 100}%;bottom:${(Number(t.global_y_cm) / h) * 100}%"
-         title="0x${Number(t.uid).toString(16).toUpperCase().padStart(4, "0")}">
-      T
-    </div>
-  `).join("");
-
-  return `
-    <div class="room-preview-head">
-      <b>${esc(room.name)}</b>
-      <span>${room.width_cm} x ${room.height_cm} cm</span>
-    </div>
-    <div class="room-preview" style="aspect-ratio:${w}/${h}">
-      ${anchorsHtml}
-      ${tagsHtml}
-    </div>
-  `;
-}
 
 function renderRoomInspector(room, anchor) {
   if (!anchor) {
     return `
       <h3>Inspector</h3>
-      <p class="room-empty">Select an anchor dot to edit it. Pick an unplaced anchor, then click the map to place it.</p>
-      <div class="room-mini-help">
-        <span>Drag anchor dots to move.</span>
-        <span>Drag square handles to rotate heading.</span>
-        <span>Live tags appear as yellow points.</span>
-      </div>
+      <p class="room-empty">Click an anchor on the map to select it.<br>Drag the circle to move. Drag the red □ to rotate the x-axis or the green □ to rotate the y-axis.</p>
     `;
   }
 
@@ -505,19 +376,34 @@ function renderRoomInspector(room, anchor) {
     <h3>Selected Anchor</h3>
     <div class="anchor-inspector-card">
       <b>${esc(anchor.eui || anchorDisplayById(anchor.anchor_id_str || anchor.anchor_id))}</b>
-      <span>UWB ${hex16(anchor.uwb_short_id)}</span>
-      <span>X ${anchor.room_x_cm} cm, Y ${anchor.room_y_cm} cm</span>
-      <span>Heading ${Number(anchor.heading_deg || 0).toFixed(1)} deg</span>
-      <span>Radius ${anchor.danger_radius_cm} cm</span>
-      <span>${anchor.lock_enabled ? "Lock enabled" : "Lock disabled"}</span>
+    </div>
+    <div class="inspector-fields">
+      <label>UWB Short ID</label>
+      <input id="insp-uwb" type="number" min="0" max="65535" value="${numberOrBlank(anchor.uwb_short_id)}" placeholder="0" />
+      <label>X position (cm)</label>
+      <input id="insp-x" type="number" value="${numberOrBlank(anchor.room_x_cm)}" placeholder="0" />
+      <label>Y position (cm)</label>
+      <input id="insp-y" type="number" value="${numberOrBlank(anchor.room_y_cm)}" placeholder="0" />
+      <label>X-axis angle (°)</label>
+      <input id="insp-x-angle" type="number" step="1" value="${Number(anchor.heading_deg || 0).toFixed(0)}" />
+      <label>Y-axis angle (°) <small style="color:#6b7280">= x + 90°</small></label>
+      <input id="insp-y-angle" type="number" step="1" value="${(Number(anchor.heading_deg || 0) + 90).toFixed(0)}" />
+      <label>Danger radius (cm)</label>
+      <input id="insp-radius" type="number" min="1" value="${numberOrBlank(anchor.danger_radius_cm)}" placeholder="300" />
+    </div>
+    <div class="inspector-fields">
+      <label class="room-check">
+        <input id="insp-flip-x" type="checkbox" ${anchor.flip_x ? "checked" : ""} />
+        Flip x-axis
+      </label>
+      <label class="room-check">
+        <input id="insp-flip-y" type="checkbox" ${anchor.flip_y ? "checked" : ""} />
+        Flip y-axis
+      </label>
     </div>
     <div class="visual-control-grid">
-      <button data-anchor-action="uwb">Set UWB</button>
+      <button id="insp-save-btn">Save</button>
       <button data-anchor-action="lock">${anchor.lock_enabled ? "Disable Lock" : "Enable Lock"}</button>
-      <button data-anchor-action="radius-dec">Radius -25</button>
-      <button data-anchor-action="radius-inc">Radius +25</button>
-      <button data-anchor-action="heading-dec">Rotate -15</button>
-      <button data-anchor-action="heading-inc">Rotate +15</button>
       <button data-anchor-action="remove" class="danger">Remove</button>
     </div>
   `;
@@ -526,25 +412,56 @@ function renderRoomInspector(room, anchor) {
 function renderRoomMap(room) {
   const w = Math.max(1, Number(room.width_cm || 1));
   const h = Math.max(1, Number(room.height_cm || 1));
-  const headingLen = Math.max(40, Math.min(w, h) * 0.12);
+  const axisLen  = Math.max(50, Math.min(w, h) * 0.13);
+  const anchorR  = Math.max(10, Math.min(w, h) * 0.018);
+  const labelSz  = Math.max(12, Math.min(w, h) * 0.025);
+
   const anchorSvg = (room.anchors || []).map(a => {
     const id = String(a.anchor_id_str || a.anchor_id);
-    const x = clamp(Number(a.room_x_cm || 0), 0, w);
-    const y = clamp(Number(a.room_y_cm || 0), 0, h);
-    const sy = h - y;
+    const x  = clamp(Number(a.room_x_cm || 0), 0, w);
+    const y  = clamp(Number(a.room_y_cm || 0), 0, h);
+    const sy = h - y;                             // SVG y (flipped)
     const radius = Number(a.danger_radius_cm || 0);
-    const theta = Number(a.heading_deg || 0) * Math.PI / 180;
-    const hx = x + Math.cos(theta) * headingLen;
-    const hy = sy - Math.sin(theta) * headingLen;
+    const theta  = Number(a.heading_deg || 0) * Math.PI / 180;
     const selected = String(selectedRoomAnchorId) === id;
+
+    // x-axis (red): heading_deg direction, optionally flipped
+    const tX    = a.flip_x ? theta + Math.PI : theta;
+    const xEx   = x  + Math.cos(tX) * axisLen;
+    const xEy   = sy - Math.sin(tX) * axisLen;
+
+    // y-axis (green): 90° CCW from x, optionally flipped
+    const tY    = a.flip_y ? theta - Math.PI / 2 : theta + Math.PI / 2;
+    const yEx   = x  + Math.cos(tY) * axisLen;
+    const yEy   = sy - Math.sin(tY) * axisLen;
+
+    // labels offset just past each arrowhead in its own axis direction
+    const xLx = xEx + Math.cos(tX) * (labelSz + 2);
+    const xLy = xEy - Math.sin(tX) * (labelSz + 2) + labelSz * 0.35;
+    const yLx = yEx + Math.cos(tY) * (labelSz + 2);
+    const yLy = yEy - Math.sin(tY) * (labelSz + 2) + labelSz * 0.35;
+
     return `
       <circle class="map-danger${a.lock_enabled ? "" : " disabled"}" cx="${x}" cy="${sy}" r="${radius}" />
-      <line class="map-heading" x1="${x}" y1="${sy}" x2="${hx}" y2="${hy}" />
-      <circle class="map-anchor${selected ? " selected" : ""}" cx="${x}" cy="${sy}" r="${Math.max(10, Math.min(w, h) * 0.018)}"
+
+      <line stroke="#ef4444" stroke-width="2.5" stroke-linecap="round" marker-end="url(#ax-x)"
+            x1="${x}" y1="${sy}" x2="${xEx}" y2="${xEy}" />
+      <text fill="#ef4444" font-size="${labelSz}" font-weight="bold" text-anchor="middle"
+            x="${xLx}" y="${xLy}">x</text>
+
+      <line stroke="#22c55e" stroke-width="2.5" stroke-linecap="round" marker-end="url(#ax-y)"
+            x1="${x}" y1="${sy}" x2="${yEx}" y2="${yEy}" />
+      <text fill="#22c55e" font-size="${labelSz}" font-weight="bold" text-anchor="middle"
+            x="${yLx}" y="${yLy}">y</text>
+
+      <rect class="map-axis-handle" x="${xEx - 6}" y="${xEy - 6}" width="12" height="12"
+            data-anchor-id="${id}" data-drag="x-axis" title="Drag to rotate x-axis" />
+      <rect class="map-axis-handle" x="${yEx - 6}" y="${yEy - 6}" width="12" height="12"
+            data-anchor-id="${id}" data-drag="y-axis" title="Drag to rotate y-axis" />
+
+      <circle class="map-anchor${selected ? " selected" : ""}" cx="${x}" cy="${sy}" r="${anchorR}"
               data-anchor-id="${id}" data-drag="anchor" />
-      <rect class="map-heading-handle" x="${hx - 6}" y="${hy - 6}" width="12" height="12"
-            data-anchor-id="${id}" data-drag="heading" />
-      <text class="map-label" x="${x + 14}" y="${sy - 14}">${esc(hex16(a.uwb_short_id))}</text>
+      <text class="map-label" x="${x + anchorR + 4}" y="${sy - anchorR}">${esc(hex16(a.uwb_short_id))}</text>
     `;
   }).join("");
 
@@ -569,9 +486,18 @@ function renderRoomMap(room) {
         <b>${esc(room.name)}</b>
         <span>${room.width_cm} x ${room.height_cm} cm</span>
       </div>
-      <span>${placingAnchorId ? "Click the map to place the selected anchor" : "Drag anchors or heading handles"}</span>
+      <span>${placingAnchorId ? "Click the map to place anchor" : "Drag ○ to move · drag red □ to set x-axis · drag green □ to set y-axis"}</span>
     </div>
-    <svg id="room-map-svg" class="room-map-svg" viewBox="0 0 ${w} ${h}" data-room-id="${room.id}" preserveAspectRatio="xMidYMid meet">
+    <svg id="room-map-svg" class="room-map-svg" viewBox="0 0 ${w} ${h}"
+         data-room-id="${room.id}" preserveAspectRatio="xMidYMid meet">
+      <defs>
+        <marker id="ax-x" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+          <polygon points="0 0, 7 3.5, 0 7" fill="#ef4444" />
+        </marker>
+        <marker id="ax-y" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+          <polygon points="0 0, 7 3.5, 0 7" fill="#22c55e" />
+        </marker>
+      </defs>
       <rect class="map-floor" x="0" y="0" width="${w}" height="${h}" />
       ${anchorSvg}
       ${tagSvg}
@@ -582,6 +508,13 @@ function renderRoomMap(room) {
 function renderRooms() {
   const container = document.getElementById("room-admin");
   if (!container || roomDrag) return;
+
+  // Don't clobber inspector inputs while user is editing — just refresh the map.
+  if (container.contains(document.activeElement) &&
+      document.activeElement.tagName === "INPUT") {
+    renderRoomMapOnly();
+    return;
+  }
 
   const room = selectedRoom();
   const selectedAnchor = roomAnchorById(room, selectedRoomAnchorId);
@@ -652,6 +585,17 @@ function renderAll() {
 }
 
 document.getElementById("filter-input").addEventListener("input", renderEvents);
+
+// Keep x-axis and y-axis angle inputs in sync (y = x + 90°)
+document.getElementById("room-admin").addEventListener("input", e => {
+  if (e.target.id === "insp-x-angle") {
+    const ya = document.getElementById("insp-y-angle");
+    if (ya) ya.value = (Number(e.target.value || 0) + 90).toFixed(0);
+  } else if (e.target.id === "insp-y-angle") {
+    const xa = document.getElementById("insp-x-angle");
+    if (xa) xa.value = (Number(e.target.value || 0) - 90).toFixed(0);
+  }
+});
 document.getElementById("twr-clear-btn").addEventListener("click", () => {
   twrDebug = [];
   renderTwrDebug();
@@ -716,12 +660,23 @@ document.getElementById("room-admin").addEventListener("pointerdown", e => {
   if (!room || !anchorId) return;
   selectedRoomAnchorId = anchorId;
   placingAnchorId = null;
-  roomDrag = { anchorId, mode: target.dataset.drag };
+  const _a = roomAnchorById(room, anchorId);
+  roomDrag = {
+    anchorId, mode: target.dataset.drag, moved: false,
+    startX: e.clientX, startY: e.clientY,
+    flipX: !!_a?.flip_x, flipY: !!_a?.flip_y,
+  };
+  target.setPointerCapture(e.pointerId);
   e.preventDefault();
 });
 
 document.addEventListener("pointermove", e => {
   if (!roomDrag) return;
+  const dx0 = e.clientX - roomDrag.startX;
+  const dy0 = e.clientY - roomDrag.startY;
+  if (!roomDrag.moved && dx0 * dx0 + dy0 * dy0 < 16) return;  // 4px threshold
+  roomDrag.moved = true;
+
   const room = selectedRoom();
   const point = roomMapPoint(e);
   const anchor = roomAnchorById(room, roomDrag.anchorId);
@@ -735,9 +690,13 @@ document.addEventListener("pointermove", e => {
     return;
   }
 
+  // Both axis handles rotate the same heading_deg; offset and flip adjust for each axis
   const dx = point.x - Number(anchor.room_x_cm || 0);
   const dy = point.y - Number(anchor.room_y_cm || 0);
-  const deg = Math.atan2(dy, dx) * 180 / Math.PI;
+  let deg = Math.atan2(dy, dx) * 180 / Math.PI;
+  if (roomDrag.mode === "y-axis") deg -= 90;          // y leads x by 90°
+  if (roomDrag.mode === "x-axis" && roomDrag.flipX) deg += 180;  // handle is at flipped tip
+  if (roomDrag.mode === "y-axis" && roomDrag.flipY) deg += 180;
   updateVisualAnchorLocal(room, roomDrag.anchorId, {
     heading_deg: Math.round(deg * 10) / 10,
   });
@@ -745,16 +704,26 @@ document.addEventListener("pointermove", e => {
 
 document.addEventListener("pointerup", () => {
   if (!roomDrag) return;
-  const room = selectedRoom();
-  const anchor = roomAnchorById(room, roomDrag.anchorId);
   const drag = roomDrag;
   roomDrag = null;
+  if (!drag.moved) {
+    // Pure click — just show the anchor in the inspector without saving
+    renderRooms();
+    return;
+  }
+  const room = selectedRoom();
+  const anchor = roomAnchorById(room, drag.anchorId);
   if (!room || !anchor) return;
-  saveVisualRoomAnchor(room, drag.anchorId, {
-    room_x_cm: anchor.room_x_cm,
-    room_y_cm: anchor.room_y_cm,
-    heading_deg: anchor.heading_deg,
-  });
+  if (drag.mode === "anchor") {
+    saveVisualRoomAnchor(room, drag.anchorId, {
+      room_x_cm: anchor.room_x_cm,
+      room_y_cm: anchor.room_y_cm,
+    });
+  } else {
+    saveVisualRoomAnchor(room, drag.anchorId, {
+      heading_deg: anchor.heading_deg,
+    });
+  }
 });
 
 document.getElementById("room-admin").addEventListener("click", e => {
@@ -822,17 +791,17 @@ document.getElementById("room-admin").addEventListener("click", e => {
   if (svg && placingAnchorId && !e.target.dataset.drag) {
     const point = roomMapPoint(e);
     if (!point) return;
-    const uwb = prompt("UWB short ID for this anchor", "");
-    if (uwb === null) return;
-    selectedRoomAnchorId = placingAnchorId;
-    saveVisualRoomAnchor(room, placingAnchorId, {
-      uwb_short_id: uwb,
+    const placingId = placingAnchorId;
+    placingAnchorId = null;
+    selectedRoomAnchorId = placingId;
+    saveVisualRoomAnchor(room, placingId, {
+      uwb_short_id: "",
       room_x_cm: point.x,
       room_y_cm: point.y,
       heading_deg: 0,
       danger_radius_cm: 300,
       lock_enabled: 1,
-    }).then(() => { placingAnchorId = null; });
+    });
     return;
   }
 
@@ -841,6 +810,19 @@ document.getElementById("room-admin").addEventListener("click", e => {
     selectedRoomAnchorId = mapAnchor.dataset.anchorId;
     placingAnchorId = null;
     renderRooms();
+    return;
+  }
+
+  if (e.target.id === "insp-save-btn" && selectedRoomAnchorId) {
+    saveVisualRoomAnchor(room, selectedRoomAnchorId, {
+      uwb_short_id:     document.getElementById("insp-uwb")?.value ?? "",
+      room_x_cm:        Number(document.getElementById("insp-x")?.value       || 0),
+      room_y_cm:        Number(document.getElementById("insp-y")?.value       || 0),
+      heading_deg:      Number(document.getElementById("insp-x-angle")?.value || 0),
+      danger_radius_cm: Number(document.getElementById("insp-radius")?.value  || 300),
+      flip_x:           document.getElementById("insp-flip-x")?.checked ? 1 : 0,
+      flip_y:           document.getElementById("insp-flip-y")?.checked ? 1 : 0,
+    });
     return;
   }
 
@@ -859,113 +841,11 @@ document.getElementById("room-admin").addEventListener("click", e => {
     return;
   }
 
-  if (action === "uwb") {
-    const uwb = prompt("UWB short ID", numberOrBlank(anchor.uwb_short_id));
-    if (uwb === null) return;
-    saveVisualRoomAnchor(room, selectedRoomAnchorId, { uwb_short_id: uwb });
-    return;
-  }
-
-  const updates = {};
-  if (action === "lock") updates.lock_enabled = anchor.lock_enabled ? 0 : 1;
-  if (action === "radius-dec") updates.danger_radius_cm = Math.max(1, Number(anchor.danger_radius_cm || 300) - 25);
-  if (action === "radius-inc") updates.danger_radius_cm = Number(anchor.danger_radius_cm || 300) + 25;
-  if (action === "heading-dec") updates.heading_deg = Number(anchor.heading_deg || 0) - 15;
-  if (action === "heading-inc") updates.heading_deg = Number(anchor.heading_deg || 0) + 15;
-  saveVisualRoomAnchor(room, selectedRoomAnchorId, updates);
-});
-
-document.getElementById("room-admin").addEventListener("change", e => {
-  if (e.target.id === "room-select") {
-    selectedRoomId = Number(e.target.value);
-    renderRooms();
+  if (action === "lock") {
+    saveVisualRoomAnchor(room, selectedRoomAnchorId, { lock_enabled: anchor.lock_enabled ? 0 : 1 });
   }
 });
 
-document.getElementById("room-admin").addEventListener("click", e => {
-  const room = selectedRoom();
-
-  if (e.target.id === "room-create-btn") {
-    const body = {
-      name: document.getElementById("room-new-name").value.trim() || "Room",
-      width_cm: Number(document.getElementById("room-new-width").value || 500),
-      height_cm: Number(document.getElementById("room-new-height").value || 500),
-    };
-    fetch("/api/rooms", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body) })
-      .then(r => r.json())
-      .then(created => { selectedRoomId = created.id; return fetch("/api/rooms"); })
-      .then(r => r.json())
-      .then(list => { rooms = list; renderRooms(); });
-    return;
-  }
-
-  if (!room) return;
-
-  if (e.target.id === "room-save-btn") {
-    const body = {
-      name: document.getElementById("room-edit-name").value.trim() || room.name,
-      width_cm: Number(document.getElementById("room-edit-width").value || room.width_cm),
-      height_cm: Number(document.getElementById("room-edit-height").value || room.height_cm),
-    };
-    fetch(`/api/rooms/${room.id}`, { method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body) })
-      .then(() => fetch("/api/rooms"))
-      .then(r => r.json())
-      .then(list => { rooms = list; renderRooms(); });
-    return;
-  }
-
-  if (e.target.id === "room-delete-btn") {
-    if (!confirm(`Delete room ${room.name}?`)) return;
-    fetch(`/api/rooms/${room.id}`, { method: "DELETE" })
-      .then(() => fetch("/api/rooms"))
-      .then(r => r.json())
-      .then(list => { rooms = list; selectedRoomId = rooms[0]?.id || null; renderRooms(); });
-    return;
-  }
-
-  if (e.target.id === "room-anchor-save-btn") {
-    const anchorId = document.getElementById("room-anchor-select").value;
-    if (!anchorId) return;
-    const body = {
-      uwb_short_id: document.getElementById("room-anchor-uwb").value,
-      room_x_cm: Number(document.getElementById("room-anchor-x").value || 0),
-      room_y_cm: Number(document.getElementById("room-anchor-y").value || 0),
-      heading_deg: Number(document.getElementById("room-anchor-heading").value || 0),
-      danger_radius_cm: Number(document.getElementById("room-anchor-radius").value || 300),
-      lock_enabled: document.getElementById("room-anchor-enabled").checked ? 1 : 0,
-    };
-    fetch(`/api/rooms/${room.id}/anchors/${anchorId}`, {
-      method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)
-    }).then(() => fetch("/api/rooms"))
-      .then(r => r.json())
-      .then(list => { rooms = list; renderRooms(); });
-    return;
-  }
-
-  const row = e.target.closest("tr[data-room-anchor-id]");
-  if (!row) return;
-  const anchorId = row.dataset.roomAnchorId;
-
-  if (e.target.classList.contains("room-row-save")) {
-    const body = {};
-    row.querySelectorAll("[data-field]").forEach(input => {
-      body[input.dataset.field] = input.type === "checkbox" ? (input.checked ? 1 : 0) : input.value;
-    });
-    fetch(`/api/rooms/${room.id}/anchors/${anchorId}`, {
-      method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)
-    }).then(() => fetch("/api/rooms"))
-      .then(r => r.json())
-      .then(list => { rooms = list; renderRooms(); });
-    return;
-  }
-
-  if (e.target.classList.contains("room-row-remove")) {
-    fetch(`/api/rooms/anchors/${anchorId}`, { method: "DELETE" })
-      .then(() => fetch("/api/rooms"))
-      .then(r => r.json())
-      .then(list => { rooms = list; renderRooms(); });
-  }
-});
 
 // Remove-anchor button delegation
 document.getElementById("door-cards").addEventListener("click", e => {

@@ -185,6 +185,8 @@ def init_db():
             "ALTER TABLE anchors ADD COLUMN ota_percent INTEGER DEFAULT 0",
             # EUI-64 hex string column (display / search) — anchor_id IS the EUI numeric value
             "ALTER TABLE anchors ADD COLUMN eui TEXT DEFAULT NULL",
+            "ALTER TABLE room_anchors ADD COLUMN flip_x INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE room_anchors ADD COLUMN flip_y INTEGER NOT NULL DEFAULT 0",
         ]:
             try:
                 c.execute(migration)
@@ -411,15 +413,20 @@ def _clamp_room_anchor_payload(params: dict, existing: dict | None = None) -> di
 
     uwb_raw = params.get("uwb_short_id", existing.get("uwb_short_id"))
     uwb_short_id = None if uwb_raw in (None, "") else max(0, min(0xFFFF, int(uwb_raw)))
-    enabled_raw = params.get("lock_enabled", existing.get("lock_enabled", 1))
-    lock_enabled = 0 if str(enabled_raw).lower() in ("0", "false", "off", "no", "") else 1
+
+    def _flag(name):
+        raw = params.get(name, existing.get(name, 0))
+        return 0 if str(raw).lower() in ("0", "false", "off", "no", "") else 1
+
     return {
         "uwb_short_id": uwb_short_id,
         "room_x_cm": _int("room_x_cm", 0),
         "room_y_cm": _int("room_y_cm", 0),
         "heading_deg": float(params.get("heading_deg", existing.get("heading_deg", 0.0))),
         "danger_radius_cm": _int("danger_radius_cm", 300, 1),
-        "lock_enabled": lock_enabled,
+        "lock_enabled": _flag("lock_enabled"),
+        "flip_x": _flag("flip_x"),
+        "flip_y": _flag("flip_y"),
     }
 
 
@@ -508,9 +515,9 @@ def upsert_room_anchor(room_id: int, anchor_id: int, params: dict) -> dict | Non
         conn.execute("""
             INSERT INTO room_anchors (
                 anchor_id, room_id, uwb_short_id, room_x_cm, room_y_cm,
-                heading_deg, danger_radius_cm, lock_enabled, updated_ms
+                heading_deg, danger_radius_cm, lock_enabled, flip_x, flip_y, updated_ms
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(anchor_id) DO UPDATE SET
                 room_id = excluded.room_id,
                 uwb_short_id = excluded.uwb_short_id,
@@ -519,11 +526,13 @@ def upsert_room_anchor(room_id: int, anchor_id: int, params: dict) -> dict | Non
                 heading_deg = excluded.heading_deg,
                 danger_radius_cm = excluded.danger_radius_cm,
                 lock_enabled = excluded.lock_enabled,
+                flip_x = excluded.flip_x,
+                flip_y = excluded.flip_y,
                 updated_ms = excluded.updated_ms
         """, (
             _to_db(anchor_id), int(room_id), safe["uwb_short_id"], safe["room_x_cm"],
             safe["room_y_cm"], safe["heading_deg"], safe["danger_radius_cm"],
-            safe["lock_enabled"], now_ms
+            safe["lock_enabled"], safe["flip_x"], safe["flip_y"], now_ms
         ))
         conn.commit()
         conn.close()
