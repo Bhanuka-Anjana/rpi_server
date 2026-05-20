@@ -110,6 +110,15 @@ function selectedRoom() {
   return rooms.find(r => String(r.id) === String(selectedRoomId)) || rooms[0];
 }
 
+function roomAnchorById(room, anchorId) {
+  if (!room || anchorId === null || anchorId === undefined) return null;
+  return (room.anchors || []).find(a => String(a.anchor_id_str || a.anchor_id) === String(anchorId)) || null;
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
 // ── State ─────────────────────────────────────────────────────────────
 
 let tags         = {};   // uid → tag_state row
@@ -120,6 +129,9 @@ let alerts       = [];   // alert events
 let firmwareList = [];   // [{id, version, filename, size_bytes, sha256, uploaded_ms}]
 let twrDebug     = [];   // recent raw TWR samples shown in the debug tab
 let selectedRoomId = null;
+let selectedRoomAnchorId = null;
+let placingAnchorId = null;
+let roomDrag = null;
 
 // ── Render throttling ─────────────────────────────────────────────────
 // Coalesce rapid SSE bursts: at most one DOM rebuild per animation frame.
@@ -142,7 +154,7 @@ function scheduleTagsRender() {
   requestAnimationFrame(() => {
     _tagsRenderPending = false;
     renderTags();
-    renderRoomPreviewOnly();
+    renderRoomMapOnly();
     renderStatus();
   });
 }
@@ -156,7 +168,7 @@ function scheduleTwrDebugRender() {
     _twrRenderPending = false;
     renderTags();
     renderTwrDebug();
-    renderRoomPreviewOnly();
+    renderRoomMapOnly();
     renderStatus();
   });
 }
@@ -342,15 +354,12 @@ function renderTwrDebug() {
   }).join("") || '<tr><td colspan="13" style="color:#6b7280">No TWR samples</td></tr>';
 }
 
-function renderRoomPreviewOnly() {
+function renderRoomMapOnly() {
   const container = document.getElementById("room-admin");
   if (!container) return;
-  const previewPanel = container.querySelector(".preview-panel");
-  if (!previewPanel) return;
+  const mapPanel = container.querySelector(".room-map-panel");
   const room = selectedRoom();
-  previewPanel.innerHTML = room
-    ? renderRoomPreview(room)
-    : '<div class="room-empty">Create a room to preview anchors and tags.</div>';
+  if (mapPanel && room) mapPanel.innerHTML = renderRoomMap(room);
 }
 
 function renderRooms() {
@@ -479,6 +488,146 @@ function renderRoomPreview(room) {
   `;
 }
 
+function renderRoomInspector(room, anchor) {
+  if (!anchor) {
+    return `
+      <h3>Inspector</h3>
+      <p class="room-empty">Select an anchor dot to edit it. Pick an unplaced anchor, then click the map to place it.</p>
+      <div class="room-mini-help">
+        <span>Drag anchor dots to move.</span>
+        <span>Drag square handles to rotate heading.</span>
+        <span>Live tags appear as yellow points.</span>
+      </div>
+    `;
+  }
+
+  return `
+    <h3>Selected Anchor</h3>
+    <div class="anchor-inspector-card">
+      <b>${esc(anchor.eui || anchorDisplayById(anchor.anchor_id_str || anchor.anchor_id))}</b>
+      <span>UWB ${hex16(anchor.uwb_short_id)}</span>
+      <span>X ${anchor.room_x_cm} cm, Y ${anchor.room_y_cm} cm</span>
+      <span>Heading ${Number(anchor.heading_deg || 0).toFixed(1)} deg</span>
+      <span>Radius ${anchor.danger_radius_cm} cm</span>
+      <span>${anchor.lock_enabled ? "Lock enabled" : "Lock disabled"}</span>
+    </div>
+    <div class="visual-control-grid">
+      <button data-anchor-action="uwb">Set UWB</button>
+      <button data-anchor-action="lock">${anchor.lock_enabled ? "Disable Lock" : "Enable Lock"}</button>
+      <button data-anchor-action="radius-dec">Radius -25</button>
+      <button data-anchor-action="radius-inc">Radius +25</button>
+      <button data-anchor-action="heading-dec">Rotate -15</button>
+      <button data-anchor-action="heading-inc">Rotate +15</button>
+      <button data-anchor-action="remove" class="danger">Remove</button>
+    </div>
+  `;
+}
+
+function renderRoomMap(room) {
+  const w = Math.max(1, Number(room.width_cm || 1));
+  const h = Math.max(1, Number(room.height_cm || 1));
+  const headingLen = Math.max(40, Math.min(w, h) * 0.12);
+  const anchorSvg = (room.anchors || []).map(a => {
+    const id = String(a.anchor_id_str || a.anchor_id);
+    const x = clamp(Number(a.room_x_cm || 0), 0, w);
+    const y = clamp(Number(a.room_y_cm || 0), 0, h);
+    const sy = h - y;
+    const radius = Number(a.danger_radius_cm || 0);
+    const theta = Number(a.heading_deg || 0) * Math.PI / 180;
+    const hx = x + Math.cos(theta) * headingLen;
+    const hy = sy - Math.sin(theta) * headingLen;
+    const selected = String(selectedRoomAnchorId) === id;
+    return `
+      <circle class="map-danger${a.lock_enabled ? "" : " disabled"}" cx="${x}" cy="${sy}" r="${radius}" />
+      <line class="map-heading" x1="${x}" y1="${sy}" x2="${hx}" y2="${hy}" />
+      <circle class="map-anchor${selected ? " selected" : ""}" cx="${x}" cy="${sy}" r="${Math.max(10, Math.min(w, h) * 0.018)}"
+              data-anchor-id="${id}" data-drag="anchor" />
+      <rect class="map-heading-handle" x="${hx - 6}" y="${hy - 6}" width="12" height="12"
+            data-anchor-id="${id}" data-drag="heading" />
+      <text class="map-label" x="${x + 14}" y="${sy - 14}">${esc(hex16(a.uwb_short_id))}</text>
+    `;
+  }).join("");
+
+  const tagSvg = Object.values(tags).filter(t =>
+    Number(t.room_id) === Number(room.id) &&
+    t.global_x_cm !== undefined && t.global_x_cm !== null &&
+    t.global_y_cm !== undefined && t.global_y_cm !== null
+  ).map(t => {
+    const x = clamp(Number(t.global_x_cm), 0, w);
+    const y = clamp(Number(t.global_y_cm), 0, h);
+    return `
+      <g class="map-tag">
+        <circle cx="${x}" cy="${h - y}" r="${Math.max(8, Math.min(w, h) * 0.014)}" />
+        <text x="${x + 12}" y="${h - y + 4}">0x${Number(t.uid).toString(16).toUpperCase().padStart(4, "0")}</text>
+      </g>
+    `;
+  }).join("");
+
+  return `
+    <div class="room-map-head">
+      <div>
+        <b>${esc(room.name)}</b>
+        <span>${room.width_cm} x ${room.height_cm} cm</span>
+      </div>
+      <span>${placingAnchorId ? "Click the map to place the selected anchor" : "Drag anchors or heading handles"}</span>
+    </div>
+    <svg id="room-map-svg" class="room-map-svg" viewBox="0 0 ${w} ${h}" data-room-id="${room.id}" preserveAspectRatio="xMidYMid meet">
+      <rect class="map-floor" x="0" y="0" width="${w}" height="${h}" />
+      ${anchorSvg}
+      ${tagSvg}
+    </svg>
+  `;
+}
+
+function renderRooms() {
+  const container = document.getElementById("room-admin");
+  if (!container || roomDrag) return;
+
+  const room = selectedRoom();
+  const selectedAnchor = roomAnchorById(room, selectedRoomAnchorId);
+  const unassignedAnchors = Object.values(anchors).filter(a => !roomAnchorFor(anchorKey(a)));
+
+  container.innerHTML = `
+    <div class="visual-room-layout">
+      <aside class="visual-room-sidebar">
+        <div class="room-sidebar-head">
+          <h3>Rooms</h3>
+          <button id="visual-room-create-btn">New</button>
+        </div>
+        <div class="room-list">
+          ${rooms.map(r => `
+            <button class="room-list-item${room && r.id === room.id ? " active" : ""}" data-room-id="${r.id}">
+              <span>${esc(r.name)}</span>
+              <small>${r.width_cm} x ${r.height_cm} cm</small>
+            </button>
+          `).join("") || '<p class="room-empty">No rooms configured</p>'}
+        </div>
+        ${room ? `
+          <div class="room-actions">
+            <button id="visual-room-edit-btn">Edit Size</button>
+            <button id="visual-room-delete-btn" class="danger">Delete</button>
+          </div>
+        ` : ""}
+        <h3>Place Anchors</h3>
+        <div class="anchor-palette">
+          ${unassignedAnchors.map(a => {
+            const id = anchorKey(a);
+            return `<button class="anchor-chip${String(placingAnchorId) === String(id) ? " active" : ""}" data-place-anchor="${id}">${esc(anchorLabel(a))}</button>`;
+          }).join("") || '<p class="room-empty">All known anchors are placed</p>'}
+        </div>
+      </aside>
+
+      <section class="room-map-panel">
+        ${room ? renderRoomMap(room) : '<div class="room-map-empty">Create a room to start visual setup.</div>'}
+      </section>
+
+      <aside class="visual-room-sidebar inspector">
+        ${room ? renderRoomInspector(room, selectedAnchor) : '<p class="room-empty">No room selected</p>'}
+      </aside>
+    </div>
+  `;
+}
+
 function renderStatus() {
   const now    = Date.now();
   const online = Object.values(anchors).filter(
@@ -506,6 +655,224 @@ document.getElementById("filter-input").addEventListener("input", renderEvents);
 document.getElementById("twr-clear-btn").addEventListener("click", () => {
   twrDebug = [];
   renderTwrDebug();
+});
+
+function roomMapPoint(evt) {
+  const svg = document.getElementById("room-map-svg");
+  const room = selectedRoom();
+  if (!svg || !room) return null;
+  const pt = svg.createSVGPoint();
+  pt.x = evt.clientX;
+  pt.y = evt.clientY;
+  const mapped = pt.matrixTransform(svg.getScreenCTM().inverse());
+  const w = Number(room.width_cm || 1);
+  const h = Number(room.height_cm || 1);
+  return {
+    x: Math.round(clamp(mapped.x, 0, w)),
+    y: Math.round(clamp(h - mapped.y, 0, h)),
+  };
+}
+
+function fetchRoomsAndRender() {
+  return fetch("/api/rooms")
+    .then(r => r.json())
+    .then(list => {
+      rooms = list || [];
+      renderRooms();
+    });
+}
+
+function saveVisualRoomAnchor(room, anchorId, updates) {
+  const current = roomAnchorById(room, anchorId) || {};
+  const body = {
+    uwb_short_id: current.uwb_short_id ?? "",
+    room_x_cm: current.room_x_cm ?? 0,
+    room_y_cm: current.room_y_cm ?? 0,
+    heading_deg: current.heading_deg ?? 0,
+    danger_radius_cm: current.danger_radius_cm ?? 300,
+    lock_enabled: current.lock_enabled ?? 1,
+    ...updates,
+  };
+  return fetch(`/api/rooms/${room.id}/anchors/${anchorId}`, {
+    method: "PUT",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body),
+  }).then(fetchRoomsAndRender);
+}
+
+function updateVisualAnchorLocal(room, anchorId, updates) {
+  const anchor = roomAnchorById(room, anchorId);
+  if (!anchor) return null;
+  Object.assign(anchor, updates);
+  renderRoomMapOnly();
+  return anchor;
+}
+
+document.getElementById("room-admin").addEventListener("pointerdown", e => {
+  const target = e.target.closest("[data-drag]");
+  if (!target) return;
+  const room = selectedRoom();
+  const anchorId = target.dataset.anchorId;
+  if (!room || !anchorId) return;
+  selectedRoomAnchorId = anchorId;
+  placingAnchorId = null;
+  roomDrag = { anchorId, mode: target.dataset.drag };
+  e.preventDefault();
+});
+
+document.addEventListener("pointermove", e => {
+  if (!roomDrag) return;
+  const room = selectedRoom();
+  const point = roomMapPoint(e);
+  const anchor = roomAnchorById(room, roomDrag.anchorId);
+  if (!room || !point || !anchor) return;
+
+  if (roomDrag.mode === "anchor") {
+    updateVisualAnchorLocal(room, roomDrag.anchorId, {
+      room_x_cm: point.x,
+      room_y_cm: point.y,
+    });
+    return;
+  }
+
+  const dx = point.x - Number(anchor.room_x_cm || 0);
+  const dy = point.y - Number(anchor.room_y_cm || 0);
+  const deg = Math.atan2(dy, dx) * 180 / Math.PI;
+  updateVisualAnchorLocal(room, roomDrag.anchorId, {
+    heading_deg: Math.round(deg * 10) / 10,
+  });
+});
+
+document.addEventListener("pointerup", () => {
+  if (!roomDrag) return;
+  const room = selectedRoom();
+  const anchor = roomAnchorById(room, roomDrag.anchorId);
+  const drag = roomDrag;
+  roomDrag = null;
+  if (!room || !anchor) return;
+  saveVisualRoomAnchor(room, drag.anchorId, {
+    room_x_cm: anchor.room_x_cm,
+    room_y_cm: anchor.room_y_cm,
+    heading_deg: anchor.heading_deg,
+  });
+});
+
+document.getElementById("room-admin").addEventListener("click", e => {
+  const room = selectedRoom();
+
+  const roomButton = e.target.closest(".room-list-item");
+  if (roomButton) {
+    selectedRoomId = Number(roomButton.dataset.roomId);
+    selectedRoomAnchorId = null;
+    placingAnchorId = null;
+    renderRooms();
+    return;
+  }
+
+  const placeButton = e.target.closest("[data-place-anchor]");
+  if (placeButton) {
+    placingAnchorId = placeButton.dataset.placeAnchor;
+    selectedRoomAnchorId = null;
+    renderRooms();
+    return;
+  }
+
+  if (e.target.id === "visual-room-create-btn") {
+    const name = prompt("Room name", "Room");
+    if (name === null) return;
+    const width = Number(prompt("Room width in cm", "500") || 500);
+    const height = Number(prompt("Room height in cm", "500") || 500);
+    fetch("/api/rooms", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ name: name.trim() || "Room", width_cm: width, height_cm: height }),
+    }).then(r => r.json())
+      .then(created => { selectedRoomId = created.id; return fetchRoomsAndRender(); });
+    return;
+  }
+
+  if (!room) return;
+
+  if (e.target.id === "visual-room-edit-btn") {
+    const name = prompt("Room name", room.name);
+    if (name === null) return;
+    const width = Number(prompt("Room width in cm", String(room.width_cm)) || room.width_cm);
+    const height = Number(prompt("Room height in cm", String(room.height_cm)) || room.height_cm);
+    fetch(`/api/rooms/${room.id}`, {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ name: name.trim() || room.name, width_cm: width, height_cm: height }),
+    }).then(fetchRoomsAndRender);
+    return;
+  }
+
+  if (e.target.id === "visual-room-delete-btn") {
+    if (!confirm(`Delete room ${room.name}?`)) return;
+    fetch(`/api/rooms/${room.id}`, { method: "DELETE" })
+      .then(() => {
+        selectedRoomId = null;
+        selectedRoomAnchorId = null;
+        placingAnchorId = null;
+        return fetchRoomsAndRender();
+      });
+    return;
+  }
+
+  const svg = e.target.closest("#room-map-svg");
+  if (svg && placingAnchorId && !e.target.dataset.drag) {
+    const point = roomMapPoint(e);
+    if (!point) return;
+    const uwb = prompt("UWB short ID for this anchor", "");
+    if (uwb === null) return;
+    selectedRoomAnchorId = placingAnchorId;
+    saveVisualRoomAnchor(room, placingAnchorId, {
+      uwb_short_id: uwb,
+      room_x_cm: point.x,
+      room_y_cm: point.y,
+      heading_deg: 0,
+      danger_radius_cm: 300,
+      lock_enabled: 1,
+    }).then(() => { placingAnchorId = null; });
+    return;
+  }
+
+  const mapAnchor = e.target.closest("[data-anchor-id]");
+  if (mapAnchor && !e.target.dataset.drag) {
+    selectedRoomAnchorId = mapAnchor.dataset.anchorId;
+    placingAnchorId = null;
+    renderRooms();
+    return;
+  }
+
+  const actionBtn = e.target.closest("[data-anchor-action]");
+  if (!actionBtn || !selectedRoomAnchorId) return;
+  const anchor = roomAnchorById(room, selectedRoomAnchorId);
+  if (!anchor) return;
+
+  const action = actionBtn.dataset.anchorAction;
+  if (action === "remove") {
+    fetch(`/api/rooms/anchors/${selectedRoomAnchorId}`, { method: "DELETE" })
+      .then(() => {
+        selectedRoomAnchorId = null;
+        return fetchRoomsAndRender();
+      });
+    return;
+  }
+
+  if (action === "uwb") {
+    const uwb = prompt("UWB short ID", numberOrBlank(anchor.uwb_short_id));
+    if (uwb === null) return;
+    saveVisualRoomAnchor(room, selectedRoomAnchorId, { uwb_short_id: uwb });
+    return;
+  }
+
+  const updates = {};
+  if (action === "lock") updates.lock_enabled = anchor.lock_enabled ? 0 : 1;
+  if (action === "radius-dec") updates.danger_radius_cm = Math.max(1, Number(anchor.danger_radius_cm || 300) - 25);
+  if (action === "radius-inc") updates.danger_radius_cm = Number(anchor.danger_radius_cm || 300) + 25;
+  if (action === "heading-dec") updates.heading_deg = Number(anchor.heading_deg || 0) - 15;
+  if (action === "heading-inc") updates.heading_deg = Number(anchor.heading_deg || 0) + 15;
+  saveVisualRoomAnchor(room, selectedRoomAnchorId, updates);
 });
 
 document.getElementById("room-admin").addEventListener("change", e => {
