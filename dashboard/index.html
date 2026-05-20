@@ -20,6 +20,7 @@
     <button class="tab-btn active" data-tab="tags">Tags</button>
     <button class="tab-btn" data-tab="doors">Doors</button>
     <button class="tab-btn" data-tab="alerts">Alerts</button>
+    <button class="tab-btn" data-tab="twr-debug">TWR Debug</button>
     <button class="tab-btn" data-tab="events">Event Log</button>
     <button class="tab-btn" data-tab="firmware">Firmware</button>
   </nav>
@@ -56,6 +57,33 @@
         <tr><th>Time</th><th>Anchor</th><th>Type</th><th>Tag</th><th>Details</th></tr>
       </thead>
       <tbody id="alert-tbody"></tbody>
+    </table>
+  </section>
+
+  <!-- TWR Debug Tab -->
+  <section id="tab-twr-debug" class="tab">
+    <h2>TWR Debug</h2>
+    <div class="toolbar debug-toolbar">
+      <button id="twr-clear-btn">Clear</button>
+      <span id="twr-debug-count">0 samples</span>
+    </div>
+    <table id="twr-debug-table">
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Anchor</th>
+          <th>UART Anchor</th>
+          <th>Tag UID</th>
+          <th>Distance</th>
+          <th>Range</th>
+          <th>Flags</th>
+          <th>Escort</th>
+          <th>Decision</th>
+          <th>Sent</th>
+          <th>Raw Frame</th>
+        </tr>
+      </thead>
+      <tbody id="twr-debug-tbody"></tbody>
     </table>
   </section>
 

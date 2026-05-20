@@ -146,6 +146,29 @@ tbody tr:hover { background: #1a1d27; }
   width: 280px;
   font-size: 0.88rem;
 }
+.toolbar button {
+  background: #1e3a5f;
+  border: 1px solid #2563eb;
+  color: #60a5fa;
+  border-radius: 6px;
+  padding: 7px 14px;
+  font-size: 0.88rem;
+  cursor: pointer;
+}
+.toolbar button:hover { background: #2563eb; color: #fff; }
+.debug-toolbar { display: flex; align-items: center; gap: 12px; }
+#twr-debug-count { color: #9ca3af; font-size: 0.82rem; }
+.raw-cell {
+  max-width: 260px;
+  word-break: break-all;
+  font-family: Consolas, 'Courier New', monospace;
+  font-size: 0.78rem;
+  color: #9ca3af;
+}
+.pill.decision-lock { background: #1e3a5f; color: #60a5fa; }
+.pill.decision-unlock { background: #1a3a2a; color: #34d399; }
+.pill.decision-sent { background: #3a2b10; color: #fbbf24; }
+.pill.decision-idle { background: #2a2d3a; color: #9ca3af; }
 
 /* OTA section inside door cards */
 .ota-section { margin-top:10px; border-top:1px solid #374151; padding-top:8px; }

@@ -51,8 +51,14 @@ _pending_ota: dict[int, int] = {}
 _HIGH_FREQ_TYPES = frozenset({"EVT_RTLS_UPDATE", "EVT_TWR_SAMPLE", "EVT_HEARTBEAT"})
 
 _LOCK_STATE_HOLD_MS = 5000
+_LOCK_STATE_RENEW_MS = 2000
+_TWR_TAG_STALE_MS = 5000
 _DEFAULT_LOCK_DISTANCE_CM = 300
 _anchor_lock_distance_cm: dict[int, int] = {}
+_anchor_lock_decision: dict[int, bool] = {}
+_anchor_lock_last_sent_ms: dict[int, int] = {}
+_anchor_twr_tags: dict[int, dict[int, dict]] = {}
+_anchor_twr_expiry_tasks: dict[int, asyncio.Task] = {}
 
 _RAW_TWR_START = 0xAA
 _RAW_TWR_END = 0x55
@@ -152,6 +158,22 @@ def _normalize_rtls_update(evt: dict):
             except (TypeError, ValueError):
                 pass
 
+    if evt.get("dist_cm") is None:
+        d = twr.get("D")
+        if d is not None:
+            try:
+                evt["dist_cm"] = int(d)
+            except (TypeError, ValueError):
+                pass
+
+    if evt.get("escort") is None:
+        x = twr.get("X")
+        if x is not None:
+            try:
+                evt["escort"] = 1 if int(x) else 0
+            except (TypeError, ValueError):
+                pass
+
 
 def _decode_raw_twr_frame(frame: bytes) -> dict | None:
     """Decode the raw 11-byte UART TWR frame on the server side."""
@@ -180,25 +202,11 @@ def _decode_raw_twr_frame(frame: bytes) -> dict | None:
         "anchor_short_id": anchor_short_id,
         "dist_cm": dist_cm,
         "range_num": range_num,
+        "flags": flags,
+        "checksum": frame[9],
         "escort": 1 if (flags & 0x01) else 0,
         "raw_hex": frame.hex().upper(),
     }
-
-    if evt.get("dist_cm") is None:
-        d = twr.get("D")
-        if d is not None:
-            try:
-                evt["dist_cm"] = int(d)
-            except (TypeError, ValueError):
-                pass
-
-    if evt.get("escort") is None:
-        x = twr.get("X")
-        if x is not None:
-            try:
-                evt["escort"] = 1 if int(x) else 0
-            except (TypeError, ValueError):
-                pass
 
 
 def _build_ssl_context() -> ssl.SSLContext:
@@ -270,6 +278,12 @@ async def push_config(anchor_id: int, cfg: dict):
 async def kick_anchor(anchor_id: int):
     """Close the TCP connection for anchor_id."""
     writer = _anchor_writers.pop(anchor_id, None)
+    _anchor_lock_decision.pop(anchor_id, None)
+    _anchor_lock_last_sent_ms.pop(anchor_id, None)
+    _anchor_twr_tags.pop(anchor_id, None)
+    task = _anchor_twr_expiry_tasks.pop(anchor_id, None)
+    if task:
+        task.cancel()
     if writer:
         writer.close()
         log.info("[TCP] Kicked anchor %d (manually removed)", anchor_id)
@@ -290,10 +304,10 @@ async def push_command(anchor_id: int, cmd: dict):
 
 
 async def _push_lock_state(anchor_id: int, locked: bool, evt: dict):
-    """Renew the server-decided door lock state on the reporting anchor."""
+    """Push the server-decided door lock state to the reporting anchor."""
     writer = _anchor_writers.get(anchor_id)
     if not writer:
-        return
+        return False
 
     cmd = {
         "type": "LOCK_STATE",
@@ -311,13 +325,95 @@ async def _push_lock_state(anchor_id: int, locked: bool, evt: dict):
         await writer.drain()
         log.debug("[TCP] LOCK_STATE locked=%s pushed to anchor %d tag=%s dist=%s",
                   locked, anchor_id, evt.get("tag_uid"), evt.get("dist_cm"))
+        return True
     except Exception as e:
         log.warning("[TCP] LOCK_STATE push failed for anchor %d: %s", anchor_id, e)
+        return False
+
+
+def _prune_anchor_twr_tags(anchor_id: int, now_ms: int) -> dict[int, dict]:
+    tags = _anchor_twr_tags.get(anchor_id)
+    if not tags:
+        return {}
+
+    expired = [tag_uid for tag_uid, sample in tags.items()
+               if sample.get("expires_at_ms", 0) <= now_ms]
+    for tag_uid in expired:
+        tags.pop(tag_uid, None)
+
+    if not tags:
+        _anchor_twr_tags.pop(anchor_id, None)
+        return {}
+    return tags
+
+
+def _anchor_has_in_range_tag(anchor_id: int, threshold: int, now_ms: int) -> bool:
+    tags = _prune_anchor_twr_tags(anchor_id, now_ms)
+    return any(int(sample.get("dist_cm", 65535)) <= threshold
+               for sample in tags.values())
+
+
+async def _schedule_anchor_twr_expiry(anchor_id: int):
+    current_task = asyncio.current_task()
+    old_task = _anchor_twr_expiry_tasks.pop(anchor_id, None)
+    if old_task and old_task is not current_task:
+        old_task.cancel()
+
+    tags = _anchor_twr_tags.get(anchor_id)
+    if not tags:
+        return
+
+    next_expiry_ms = min(sample["expires_at_ms"] for sample in tags.values())
+    _anchor_twr_expiry_tasks[anchor_id] = asyncio.create_task(
+        _anchor_twr_expiry_worker(anchor_id, next_expiry_ms)
+    )
+
+
+async def _anchor_twr_expiry_worker(anchor_id: int, expiry_ms: int):
+    try:
+        delay_s = max(0.0, (expiry_ms - int(time.time() * 1000)) / 1000.0)
+        await asyncio.sleep(delay_s)
+
+        now_ms = int(time.time() * 1000)
+        threshold = _anchor_lock_distance_cm.get(anchor_id)
+        if threshold is None:
+            cfg = db.get_anchor_config(anchor_id)
+            threshold = int(cfg.get("lock_distance_cm") or _DEFAULT_LOCK_DISTANCE_CM)
+            _anchor_lock_distance_cm[anchor_id] = threshold
+
+        locked = _anchor_has_in_range_tag(anchor_id, threshold, now_ms)
+        if not locked and _anchor_lock_decision.get(anchor_id) is True:
+            _anchor_lock_decision[anchor_id] = False
+            evt = {
+                "type": "LOCK_STATE_TIMEOUT",
+                "ts_ms": now_ms,
+                "anchor_id": anchor_id,
+                "anchor_id_str": str(anchor_id),
+                "lock_threshold_cm": threshold,
+                "lock_window_ms": _LOCK_STATE_HOLD_MS,
+                "lock_decision": "UNLOCK",
+                "lock_decision_changed": True,
+                "lock_command_sent": False,
+                "lock_expiry_owner": "anchor",
+            }
+            if _broadcast_fn:
+                _broadcast_fn(evt)
+
+        await _schedule_anchor_twr_expiry(anchor_id)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        if _anchor_twr_expiry_tasks.get(anchor_id) is asyncio.current_task():
+            _anchor_twr_expiry_tasks.pop(anchor_id, None)
 
 
 async def _apply_twr_lock_decision(anchor_id: int, evt: dict):
-    """Distance-threshold v1 lock decision for immediate raw TWR samples."""
+    """Server-owned distance and freshness decision for raw TWR samples."""
     if evt.get("type") != "EVT_TWR_SAMPLE":
+        return
+
+    tag_uid = evt.get("tag_uid")
+    if tag_uid is None:
         return
 
     dist_cm = evt.get("dist_cm")
@@ -325,6 +421,7 @@ async def _apply_twr_lock_decision(anchor_id: int, evt: dict):
         return
 
     try:
+        tag_uid = int(tag_uid)
         dist_cm = int(dist_cm)
     except (TypeError, ValueError):
         return
@@ -335,8 +432,42 @@ async def _apply_twr_lock_decision(anchor_id: int, evt: dict):
         threshold = int(cfg.get("lock_distance_cm") or _DEFAULT_LOCK_DISTANCE_CM)
         _anchor_lock_distance_cm[anchor_id] = threshold
 
-    if dist_cm <= threshold:
-        await _push_lock_state(anchor_id, True, evt)
+    now_ms = int(time.time() * 1000)
+    tags = _anchor_twr_tags.setdefault(anchor_id, {})
+    tags[tag_uid] = {
+        "dist_cm": dist_cm,
+        "expires_at_ms": now_ms + _TWR_TAG_STALE_MS,
+        "range_num": evt.get("range_num"),
+        "escort": evt.get("escort", 0),
+    }
+
+    locked = _anchor_has_in_range_tag(anchor_id, threshold, now_ms)
+    previous = _anchor_lock_decision.get(anchor_id)
+
+    evt["lock_threshold_cm"] = threshold
+    evt["lock_window_ms"] = _LOCK_STATE_HOLD_MS
+    evt["lock_renew_ms"] = _LOCK_STATE_RENEW_MS
+    evt["lock_expiry_owner"] = "anchor"
+    evt["lock_decision"] = "LOCK" if locked else "UNLOCK"
+    evt["lock_decision_changed"] = previous is not locked
+    evt["lock_command_sent"] = False
+
+    await _schedule_anchor_twr_expiry(anchor_id)
+
+    if not locked:
+        if previous is True:
+            _anchor_lock_decision[anchor_id] = False
+        return
+
+    last_sent_ms = _anchor_lock_last_sent_ms.get(anchor_id, 0)
+    should_send = previous is not True or (now_ms - last_sent_ms) >= _LOCK_STATE_RENEW_MS
+    if not should_send:
+        return
+
+    if await _push_lock_state(anchor_id, True, evt):
+        _anchor_lock_decision[anchor_id] = True
+        _anchor_lock_last_sent_ms[anchor_id] = now_ms
+        evt["lock_command_sent"] = True
 
 
 def _persist_event(evt: dict):
@@ -675,6 +806,12 @@ async def _handle_anchor(reader: asyncio.StreamReader,
         log.info("[TCP] Anchor %d disconnected from %s", anchor_id_cert, peer)
         if _anchor_writers.get(anchor_id_cert) is writer:
             del _anchor_writers[anchor_id_cert]
+        _anchor_lock_decision.pop(anchor_id_cert, None)
+        _anchor_lock_last_sent_ms.pop(anchor_id_cert, None)
+        _anchor_twr_tags.pop(anchor_id_cert, None)
+        task = _anchor_twr_expiry_tasks.pop(anchor_id_cert, None)
+        if task:
+            task.cancel()
         writer.close()
 
 

@@ -5,6 +5,7 @@ const ALERT_TYPES = new Set([
   "EVT_FIRE_ALARM", "EVT_ALARM_DOOR_FORCED",
   "EVT_ALARM_UNAUTHORIZED", "EVT_TAG_LOST"
 ]);
+const TWR_DEBUG_LIMIT = 300;
 
 // ── Tab switching ─────────────────────────────────────────────────────
 
@@ -48,6 +49,27 @@ function anchorLabel(row) {
   return row?.eui || anchorKey(row) || "—";
 }
 
+function hex16(value) {
+  if (value === undefined || value === null || value === "") return "-";
+  if (value === undefined || value === null || value === "") return "â€”";
+  const num = Number(value);
+  if (!Number.isFinite(num)) return String(value);
+  return `0x${num.toString(16).toUpperCase().padStart(4, "0")}`;
+}
+
+function hex8(value) {
+  if (value === undefined || value === null || value === "") return "-";
+  const num = Number(value);
+  if (!Number.isFinite(num)) return String(value);
+  return `0x${num.toString(16).toUpperCase().padStart(2, "0")}`;
+}
+
+function boolLabel(value) {
+  if (value === undefined || value === null) return "-";
+  if (value === undefined || value === null) return "â€”";
+  return Number(value) ? "YES" : "NO";
+}
+
 function storeAnchor(row) {
   const id = anchorKey(row);
   if (id !== undefined) anchors[id] = row;
@@ -61,6 +83,7 @@ let anchors      = {};   // anchor_id → anchor row
 let events       = [];   // recent events (capped at 200)
 let alerts       = [];   // alert events
 let firmwareList = [];   // [{id, version, filename, size_bytes, sha256, uploaded_ms}]
+let twrDebug     = [];   // recent raw TWR samples shown in the debug tab
 
 // ── Render throttling ─────────────────────────────────────────────────
 // Coalesce rapid SSE bursts: at most one DOM rebuild per animation frame.
@@ -88,6 +111,18 @@ function scheduleTagsRender() {
 }
 
 // RTLS event types — high-frequency position updates that only affect the tags panel
+let _twrRenderPending = false;
+function scheduleTwrDebugRender() {
+  if (_twrRenderPending || _renderPending) return;
+  _twrRenderPending = true;
+  requestAnimationFrame(() => {
+    _twrRenderPending = false;
+    renderTags();
+    renderTwrDebug();
+    renderStatus();
+  });
+}
+
 const RTLS_TYPES = new Set([
   "EVT_RTLS_UPDATE", "EVT_TWR_SAMPLE", "EVT_TAG_APPROACH", "EVT_TAG_AT_DOOR", "EVT_TAG_RETREAT"
 ]);
@@ -235,6 +270,38 @@ function renderEvents() {
   `).join("") || '<tr><td colspan="5" style="color:#6b7280">No events</td></tr>';
 }
 
+function renderTwrDebug() {
+  const tbody = document.getElementById("twr-debug-tbody");
+  const count = document.getElementById("twr-debug-count");
+  if (!tbody) return;
+  if (count) count.textContent = `${twrDebug.length} sample${twrDebug.length === 1 ? "" : "s"}`;
+
+  tbody.innerHTML = twrDebug.map(e => {
+    const decision = e.lock_decision || "â€”";
+    const decisionClass = decision === "LOCK" ? "decision-lock" :
+                          decision === "UNLOCK" ? "decision-unlock" : "";
+    const sentText = e.lock_command_sent ? "YES" :
+                     e.lock_expiry_owner === "anchor" && decision === "UNLOCK" ? "ANCHOR TIMER" :
+                     e.lock_decision_changed === false ? "NO CHANGE" : "NO";
+    const sentClass = e.lock_command_sent ? "decision-sent" : "decision-idle";
+    return `
+    <tr>
+      <td>${formatTime(e.ts_ms)}</td>
+      <td>${anchorLabel(e)}</td>
+      <td>${hex16(e.anchor_short_id)}</td>
+      <td>${hex16(e.tag_uid)}</td>
+      <td>${e.dist_cm ?? "â€”"}${e.lock_threshold_cm !== undefined ? ` / ${e.lock_threshold_cm}` : ""}</td>
+      <td>${e.range_num ?? "â€”"}</td>
+      <td>${hex8(e.flags)}</td>
+      <td>${boolLabel(e.escort)}</td>
+      <td><span class="pill ${decisionClass}">${decision}</span></td>
+      <td><span class="pill ${sentClass}">${sentText}</span></td>
+      <td class="raw-cell">${e.raw_hex || "â€”"}</td>
+    </tr>
+  `;
+  }).join("") || '<tr><td colspan="11" style="color:#6b7280">No TWR samples</td></tr>';
+}
+
 function renderStatus() {
   const now    = Date.now();
   const online = Object.values(anchors).filter(
@@ -251,12 +318,17 @@ function renderAll() {
   renderTags();
   renderDoors();
   renderAlerts();
+  renderTwrDebug();
   renderEvents();
   renderFirmware();
   renderStatus();
 }
 
 document.getElementById("filter-input").addEventListener("input", renderEvents);
+document.getElementById("twr-clear-btn").addEventListener("click", () => {
+  twrDebug = [];
+  renderTwrDebug();
+});
 
 // Remove-anchor button delegation
 document.getElementById("door-cards").addEventListener("click", e => {
@@ -420,6 +492,13 @@ function connect() {
     }
 
     // RTLS position updates — only refresh tags panel, skip events log
+    if (etype === "EVT_TWR_SAMPLE") {
+      twrDebug.unshift(msg);
+      if (twrDebug.length > TWR_DEBUG_LIMIT) twrDebug.length = TWR_DEBUG_LIMIT;
+      scheduleTwrDebugRender();
+      return;
+    }
+
     if (RTLS_TYPES.has(etype)) {
       scheduleTagsRender();
       return;
