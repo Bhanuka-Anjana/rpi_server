@@ -142,7 +142,7 @@ function scheduleTagsRender() {
   requestAnimationFrame(() => {
     _tagsRenderPending = false;
     renderTags();
-    renderRooms();
+    renderRoomPreviewOnly();
     renderStatus();
   });
 }
@@ -156,7 +156,7 @@ function scheduleTwrDebugRender() {
     _twrRenderPending = false;
     renderTags();
     renderTwrDebug();
-    renderRooms();
+    renderRoomPreviewOnly();
     renderStatus();
   });
 }
@@ -342,9 +342,27 @@ function renderTwrDebug() {
   }).join("") || '<tr><td colspan="13" style="color:#6b7280">No TWR samples</td></tr>';
 }
 
+function renderRoomPreviewOnly() {
+  const container = document.getElementById("room-admin");
+  if (!container) return;
+  const previewPanel = container.querySelector(".preview-panel");
+  if (!previewPanel) return;
+  const room = selectedRoom();
+  previewPanel.innerHTML = room
+    ? renderRoomPreview(room)
+    : '<div class="room-empty">Create a room to preview anchors and tags.</div>';
+}
+
 function renderRooms() {
   const container = document.getElementById("room-admin");
   if (!container) return;
+
+  // Don't clobber inputs the user is actively editing — just refresh the preview.
+  if (container.contains(document.activeElement) &&
+      (document.activeElement.tagName === "INPUT" || document.activeElement.tagName === "SELECT")) {
+    renderRoomPreviewOnly();
+    return;
+  }
 
   const room = selectedRoom();
   const roomOptions = rooms.map(r =>
