@@ -51,7 +51,6 @@ function anchorLabel(row) {
 
 function hex16(value) {
   if (value === undefined || value === null || value === "") return "-";
-  if (value === undefined || value === null || value === "") return "â€”";
   const num = Number(value);
   if (!Number.isFinite(num)) return String(value);
   return `0x${num.toString(16).toUpperCase().padStart(4, "0")}`;
@@ -66,7 +65,6 @@ function hex8(value) {
 
 function boolLabel(value) {
   if (value === undefined || value === null) return "-";
-  if (value === undefined || value === null) return "â€”";
   return Number(value) ? "YES" : "NO";
 }
 
@@ -277,7 +275,7 @@ function renderTwrDebug() {
   if (count) count.textContent = `${twrDebug.length} sample${twrDebug.length === 1 ? "" : "s"}`;
 
   tbody.innerHTML = twrDebug.map(e => {
-    const decision = e.lock_decision || "â€”";
+    const decision = e.lock_decision || "-";
     const decisionClass = decision === "LOCK" ? "decision-lock" :
                           decision === "UNLOCK" ? "decision-unlock" : "";
     const sentText = e.lock_command_sent ? "YES" :
@@ -290,16 +288,18 @@ function renderTwrDebug() {
       <td>${anchorLabel(e)}</td>
       <td>${hex16(e.anchor_short_id)}</td>
       <td>${hex16(e.tag_uid)}</td>
-      <td>${e.dist_cm ?? "â€”"}${e.lock_threshold_cm !== undefined ? ` / ${e.lock_threshold_cm}` : ""}</td>
-      <td>${e.range_num ?? "â€”"}</td>
+      <td>${e.dist_cm ?? "-"}${e.lock_threshold_cm !== undefined ? ` / ${e.lock_threshold_cm}` : ""}</td>
+      <td>${e.x_cm ?? "-"}</td>
+      <td>${e.y_cm ?? "-"}</td>
+      <td>${e.range_num ?? "-"}</td>
       <td>${hex8(e.flags)}</td>
       <td>${boolLabel(e.escort)}</td>
       <td><span class="pill ${decisionClass}">${decision}</span></td>
       <td><span class="pill ${sentClass}">${sentText}</span></td>
-      <td class="raw-cell">${e.raw_hex || "â€”"}</td>
+      <td class="raw-cell">${e.raw_hex || "-"}</td>
     </tr>
   `;
-  }).join("") || '<tr><td colspan="11" style="color:#6b7280">No TWR samples</td></tr>';
+  }).join("") || '<tr><td colspan="13" style="color:#6b7280">No TWR samples</td></tr>';
 }
 
 function renderStatus() {
@@ -485,6 +485,8 @@ function connect() {
         uid:            msg.tag_uid,
         nearest_anchor: id,
         dist_cm:        msg.dist_cm,
+        x_cm:           msg.x_cm,
+        y_cm:           msg.y_cm,
         gear:           msg.gear,
         escort:         msg.escort,
         last_seen_ms:   msg.ts_ms,

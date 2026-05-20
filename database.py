@@ -59,6 +59,8 @@ def init_db():
                 uid              INTEGER PRIMARY KEY,
                 nearest_anchor   INTEGER,
                 dist_cm          INTEGER,
+                x_cm             INTEGER,
+                y_cm             INTEGER,
                 gear             INTEGER,
                 escort           INTEGER DEFAULT 0,
                 last_seen_ms     INTEGER
@@ -136,6 +138,8 @@ def init_db():
             "ALTER TABLE anchor_config ADD COLUMN lock_distance_cm INTEGER DEFAULT 300",
             "ALTER TABLE anchor_config ADD COLUMN wifi_networks TEXT DEFAULT '[]'",
             "ALTER TABLE anchor_config ADD COLUMN wifi_count INTEGER DEFAULT 0",
+            "ALTER TABLE tag_state ADD COLUMN x_cm INTEGER DEFAULT NULL",
+            "ALTER TABLE tag_state ADD COLUMN y_cm INTEGER DEFAULT NULL",
             "ALTER TABLE anchors ADD COLUMN boot_count INTEGER DEFAULT 0",
             "ALTER TABLE anchors ADD COLUMN fw_version  TEXT    DEFAULT NULL",
             "ALTER TABLE anchors ADD COLUMN ota_status  TEXT    DEFAULT 'IDLE'",
@@ -200,19 +204,22 @@ def upsert_anchor(anchor_id: int, anchor_type: int = None, boot_count: int = Non
 
 
 def upsert_tag_state(uid: int, anchor_id: int, dist_cm: int,
-                     gear: int = None, escort: int = 0):
+                     gear: int = None, escort: int = 0,
+                     x_cm: int = None, y_cm: int = None):
     with _lock:
         conn = get_conn()
         conn.execute("""
-            INSERT INTO tag_state (uid, nearest_anchor, dist_cm, gear, escort, last_seen_ms)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO tag_state (uid, nearest_anchor, dist_cm, x_cm, y_cm, gear, escort, last_seen_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(uid) DO UPDATE SET
                 nearest_anchor = excluded.nearest_anchor,
                 dist_cm        = excluded.dist_cm,
+                x_cm           = COALESCE(excluded.x_cm, x_cm),
+                y_cm           = COALESCE(excluded.y_cm, y_cm),
                 gear           = COALESCE(excluded.gear, gear),
                 escort         = excluded.escort,
                 last_seen_ms   = excluded.last_seen_ms
-        """, (uid, _to_db(anchor_id), dist_cm, gear, escort, int(time.time() * 1000)))
+        """, (uid, _to_db(anchor_id), dist_cm, x_cm, y_cm, gear, escort, int(time.time() * 1000)))
         conn.commit()
         conn.close()
 

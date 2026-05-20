@@ -62,7 +62,7 @@ _anchor_twr_expiry_tasks: dict[int, asyncio.Task] = {}
 
 _RAW_TWR_START = 0xAA
 _RAW_TWR_END = 0x55
-_RAW_TWR_FRAME_LEN = 11
+_RAW_TWR_FRAME_LEN = 15
 
 # Rate-limit tag_state DB writes — SSE delivers real-time position, DB only needs
 # a fresh snapshot for page reloads. Write at most once per _TAG_DB_INTERVAL seconds.
@@ -176,18 +176,18 @@ def _normalize_rtls_update(evt: dict):
 
 
 def _decode_raw_twr_frame(frame: bytes) -> dict | None:
-    """Decode the raw 11-byte UART TWR frame on the server side."""
+    """Decode the raw 15-byte UART TWR frame on the server side."""
     if len(frame) != _RAW_TWR_FRAME_LEN:
         return None
-    if frame[0] != _RAW_TWR_START or frame[10] != _RAW_TWR_END:
+    if frame[0] != _RAW_TWR_START or frame[14] != _RAW_TWR_END:
         return None
 
     checksum = 0
-    for b in frame[1:9]:
+    for b in frame[1:13]:
         checksum ^= b
-    if checksum != frame[9]:
+    if checksum != frame[13]:
         log.warning("[TCP] Dropped raw TWR frame: checksum calc=0x%02X rx=0x%02X",
-                    checksum, frame[9])
+                    checksum, frame[13])
         return None
 
     tag_uid = frame[1] | (frame[2] << 8)
@@ -195,6 +195,8 @@ def _decode_raw_twr_frame(frame: bytes) -> dict | None:
     dist_cm = frame[5] | (frame[6] << 8)
     range_num = frame[7]
     flags = frame[8]
+    x_cm = int.from_bytes(frame[9:11], byteorder="little", signed=True)
+    y_cm = int.from_bytes(frame[11:13], byteorder="little", signed=True)
 
     return {
         "type": "EVT_TWR_SAMPLE",
@@ -203,7 +205,9 @@ def _decode_raw_twr_frame(frame: bytes) -> dict | None:
         "dist_cm": dist_cm,
         "range_num": range_num,
         "flags": flags,
-        "checksum": frame[9],
+        "x_cm": x_cm,
+        "y_cm": y_cm,
+        "checksum": frame[13],
         "escort": 1 if (flags & 0x01) else 0,
         "raw_hex": frame.hex().upper(),
     }
@@ -436,6 +440,8 @@ async def _apply_twr_lock_decision(anchor_id: int, evt: dict):
     tags = _anchor_twr_tags.setdefault(anchor_id, {})
     tags[tag_uid] = {
         "dist_cm": dist_cm,
+        "x_cm": evt.get("x_cm"),
+        "y_cm": evt.get("y_cm"),
         "expires_at_ms": now_ms + _TWR_TAG_STALE_MS,
         "range_num": evt.get("range_num"),
         "escort": evt.get("escort", 0),
@@ -518,7 +524,8 @@ def _persist_event(evt: dict):
                         should_write = False
                 if should_write:
                     db.upsert_tag_state(tag_uid, anchor_id, evt.get("dist_cm"),
-                                        gear=evt.get("gear"), escort=evt.get("escort", 0))
+                                        gear=evt.get("gear"), escort=evt.get("escort", 0),
+                                        x_cm=evt.get("x_cm"), y_cm=evt.get("y_cm"))
         elif etype == "EVT_HEARTBEAT":
             db.upsert_anchor(anchor_id)
         return None
