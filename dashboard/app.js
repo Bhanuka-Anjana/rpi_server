@@ -89,7 +89,7 @@ function scheduleTagsRender() {
 
 // RTLS event types — high-frequency position updates that only affect the tags panel
 const RTLS_TYPES = new Set([
-  "EVT_RTLS_UPDATE", "EVT_TAG_APPROACH", "EVT_TAG_AT_DOOR", "EVT_TAG_RETREAT"
+  "EVT_RTLS_UPDATE", "EVT_TWR_SAMPLE", "EVT_TAG_APPROACH", "EVT_TAG_AT_DOOR", "EVT_TAG_RETREAT"
 ]);
 
 // ── Render functions ──────────────────────────────────────────────────

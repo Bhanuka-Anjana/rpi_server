@@ -101,6 +101,7 @@ def init_db():
                 signal_loss_mode       TEXT    DEFAULT 'LOCK',
                 buzzer_enable          INTEGER DEFAULT 1,
                 buzzer_duration_ms     INTEGER DEFAULT 1000,
+                lock_distance_cm       INTEGER DEFAULT 300,
                 tz                     TEXT    DEFAULT '+0:00',
                 config_status          TEXT    DEFAULT 'DEFAULT',
                 updated_ms             INTEGER
@@ -132,6 +133,7 @@ def init_db():
         # Migrations — add columns introduced after initial deployment
         for migration in [
             "ALTER TABLE anchor_config ADD COLUMN tz TEXT DEFAULT '+0:00'",
+            "ALTER TABLE anchor_config ADD COLUMN lock_distance_cm INTEGER DEFAULT 300",
             "ALTER TABLE anchor_config ADD COLUMN wifi_networks TEXT DEFAULT '[]'",
             "ALTER TABLE anchor_config ADD COLUMN wifi_count INTEGER DEFAULT 0",
             "ALTER TABLE anchors ADD COLUMN boot_count INTEGER DEFAULT 0",
@@ -293,6 +295,7 @@ def get_all_anchors() -> list:
                    c.rex_duration_ms, c.relay_hold_ms,
                    c.door_ajar_timeout_ms, c.signal_loss_timeout_ms,
                    c.signal_loss_mode, c.buzzer_enable, c.buzzer_duration_ms,
+                   c.lock_distance_cm,
                    c.tz, c.wifi_count, c.config_status, c.updated_ms AS config_updated_ms
             FROM anchors a
             LEFT JOIN door_state   d ON a.anchor_id = d.anchor_id
@@ -329,6 +332,7 @@ CONFIG_SCHEMA = {
     "signal_loss_mode":       {"default": "LOCK",  "values":     ["LOCK", "UNLOCK"]},
     "buzzer_enable":          {"default": 1,       "values":     [0, 1]},
     "buzzer_duration_ms":     {"default": 1000,   "min": 100,    "max": 10000},
+    "lock_distance_cm":       {"default": 300,    "min": 10,     "max": 2000},
     # UTC offset string accepted by the anchor's parse_tz_string()
     # Format: "[+-]H:MM" or "[+-]HH:MM", range ±14:00 (±50400 s)
     "tz":                     {"default": "+0:00", "pattern": _TZ_RE},

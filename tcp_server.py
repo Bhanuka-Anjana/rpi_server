@@ -48,7 +48,15 @@ _pending_ota: dict[int, int] = {}
 # High-frequency event types:
 #   - Not written to events history table (would create massive write storm)
 #   - DB persist is fire-and-forget (don't block the asyncio loop waiting for it)
-_HIGH_FREQ_TYPES = frozenset({"EVT_RTLS_UPDATE", "EVT_HEARTBEAT"})
+_HIGH_FREQ_TYPES = frozenset({"EVT_RTLS_UPDATE", "EVT_TWR_SAMPLE", "EVT_HEARTBEAT"})
+
+_LOCK_STATE_HOLD_MS = 5000
+_DEFAULT_LOCK_DISTANCE_CM = 300
+_anchor_lock_distance_cm: dict[int, int] = {}
+
+_RAW_TWR_START = 0xAA
+_RAW_TWR_END = 0x55
+_RAW_TWR_FRAME_LEN = 11
 
 # Rate-limit tag_state DB writes — SSE delivers real-time position, DB only needs
 # a fresh snapshot for page reloads. Write at most once per _TAG_DB_INTERVAL seconds.
@@ -144,6 +152,38 @@ def _normalize_rtls_update(evt: dict):
             except (TypeError, ValueError):
                 pass
 
+
+def _decode_raw_twr_frame(frame: bytes) -> dict | None:
+    """Decode the raw 11-byte UART TWR frame on the server side."""
+    if len(frame) != _RAW_TWR_FRAME_LEN:
+        return None
+    if frame[0] != _RAW_TWR_START or frame[10] != _RAW_TWR_END:
+        return None
+
+    checksum = 0
+    for b in frame[1:9]:
+        checksum ^= b
+    if checksum != frame[9]:
+        log.warning("[TCP] Dropped raw TWR frame: checksum calc=0x%02X rx=0x%02X",
+                    checksum, frame[9])
+        return None
+
+    tag_uid = frame[1] | (frame[2] << 8)
+    anchor_short_id = frame[3] | (frame[4] << 8)
+    dist_cm = frame[5] | (frame[6] << 8)
+    range_num = frame[7]
+    flags = frame[8]
+
+    return {
+        "type": "EVT_TWR_SAMPLE",
+        "tag_uid": tag_uid,
+        "anchor_short_id": anchor_short_id,
+        "dist_cm": dist_cm,
+        "range_num": range_num,
+        "escort": 1 if (flags & 0x01) else 0,
+        "raw_hex": frame.hex().upper(),
+    }
+
     if evt.get("dist_cm") is None:
         d = twr.get("D")
         if d is not None:
@@ -205,6 +245,9 @@ async def push_config(anchor_id: int, cfg: dict):
     payload = {k: v for k, v in cfg.items() if k not in _SKIP}
     payload["type"] = "CONFIG"
     payload["anchor_id"] = anchor_id
+    _anchor_lock_distance_cm[anchor_id] = int(
+        cfg.get("lock_distance_cm") or _DEFAULT_LOCK_DISTANCE_CM
+    )
     try:
         nets = payload.get("wifi_networks", [])
         if isinstance(nets, str):
@@ -246,6 +289,56 @@ async def push_command(anchor_id: int, cmd: dict):
         log.warning("[TCP] Command push failed for anchor %d: %s", anchor_id, e)
 
 
+async def _push_lock_state(anchor_id: int, locked: bool, evt: dict):
+    """Renew the server-decided door lock state on the reporting anchor."""
+    writer = _anchor_writers.get(anchor_id)
+    if not writer:
+        return
+
+    cmd = {
+        "type": "LOCK_STATE",
+        "anchor_id": anchor_id,
+        "locked": bool(locked),
+        "hold_ms": _LOCK_STATE_HOLD_MS,
+    }
+    if evt.get("tag_uid") is not None:
+        cmd["tag_uid"] = evt.get("tag_uid")
+    if evt.get("dist_cm") is not None:
+        cmd["dist_cm"] = evt.get("dist_cm")
+
+    try:
+        writer.write((json.dumps(cmd) + "\n").encode())
+        await writer.drain()
+        log.debug("[TCP] LOCK_STATE locked=%s pushed to anchor %d tag=%s dist=%s",
+                  locked, anchor_id, evt.get("tag_uid"), evt.get("dist_cm"))
+    except Exception as e:
+        log.warning("[TCP] LOCK_STATE push failed for anchor %d: %s", anchor_id, e)
+
+
+async def _apply_twr_lock_decision(anchor_id: int, evt: dict):
+    """Distance-threshold v1 lock decision for immediate raw TWR samples."""
+    if evt.get("type") != "EVT_TWR_SAMPLE":
+        return
+
+    dist_cm = evt.get("dist_cm")
+    if dist_cm is None:
+        return
+
+    try:
+        dist_cm = int(dist_cm)
+    except (TypeError, ValueError):
+        return
+
+    threshold = _anchor_lock_distance_cm.get(anchor_id)
+    if threshold is None:
+        cfg = db.get_anchor_config(anchor_id)
+        threshold = int(cfg.get("lock_distance_cm") or _DEFAULT_LOCK_DISTANCE_CM)
+        _anchor_lock_distance_cm[anchor_id] = threshold
+
+    if dist_cm <= threshold:
+        await _push_lock_state(anchor_id, True, evt)
+
+
 def _persist_event(evt: dict):
     """Executor thread: all SQLite writes for one event.
 
@@ -281,8 +374,8 @@ def _persist_event(evt: dict):
 
     # ── High-frequency types — skip history insert, skip anchor heartbeat ──
     if etype in _HIGH_FREQ_TYPES:
-        # For RTLS: rate-limited tag_state write so the snapshot stays fresh
-        if etype == "EVT_RTLS_UPDATE":
+        # For live ranging samples: rate-limited tag_state write so the snapshot stays fresh
+        if etype in ("EVT_RTLS_UPDATE", "EVT_TWR_SAMPLE"):
             tag_uid = evt.get("tag_uid")
             if tag_uid is not None:
                 now = time.time()
@@ -395,6 +488,9 @@ async def _handle_anchor(reader: asyncio.StreamReader,
         _anchor_writers[anchor_id_cert] = writer
 
         cfg = db.get_anchor_config(anchor_id_cert)
+        _anchor_lock_distance_cm[anchor_id_cert] = int(
+            cfg.get("lock_distance_cm") or _DEFAULT_LOCK_DISTANCE_CM
+        )
         if cfg.get("config_status") == "PENDING":
             await push_config(anchor_id_cert, cfg)
 
@@ -407,7 +503,38 @@ async def _handle_anchor(reader: asyncio.StreamReader,
                 break
 
             buffer += chunk
-            while b"\n" in buffer:
+            while buffer:
+                if buffer[0] == _RAW_TWR_START:
+                    if len(buffer) < _RAW_TWR_FRAME_LEN:
+                        break
+                    frame, buffer = buffer[:_RAW_TWR_FRAME_LEN], buffer[_RAW_TWR_FRAME_LEN:]
+                    if bootstrap_pending:
+                        log.debug("[TCP] Dropped raw TWR frame from bootstrap peer before HELLO")
+                        continue
+                    evt = _decode_raw_twr_frame(frame)
+                    if evt is None:
+                        continue
+                    etype = evt.get("type", "")
+                    evt["ts_ms"] = int(time.time() * 1000)
+                    evt["anchor_id"] = anchor_id_cert
+                    evt["anchor_id_str"] = str(anchor_id_cert)
+
+                    await _apply_twr_lock_decision(anchor_id_cert, evt)
+
+                    if _broadcast_fn:
+                        _broadcast_fn(evt)
+
+                    if event_queue is not None:
+                        try:
+                            event_queue.put_nowait(evt)
+                        except asyncio.QueueFull:
+                            pass
+
+                    loop.run_in_executor(None, _persist_event, evt.copy())
+                    continue
+
+                if b"\n" not in buffer:
+                    break
                 line, buffer = buffer.split(b"\n", 1)
                 line = line.strip()
                 if not line:
@@ -452,6 +579,9 @@ async def _handle_anchor(reader: asyncio.StreamReader,
                         })
 
                         cfg = db.get_anchor_config(anchor_id_cert)
+                        _anchor_lock_distance_cm[anchor_id_cert] = int(
+                            cfg.get("lock_distance_cm") or _DEFAULT_LOCK_DISTANCE_CM
+                        )
                         if cfg.get("config_status") == "PENDING":
                             await push_config(anchor_id_cert, cfg)
 
@@ -490,6 +620,9 @@ async def _handle_anchor(reader: asyncio.StreamReader,
 
                     # ── Normalize RTLS payload (fast, on loop) ─────────────
                     _normalize_rtls_update(evt)
+
+                    # Server-side door decision for immediate TWR samples.
+                    await _apply_twr_lock_decision(anchor_id_cert, evt)
 
                     # ── CONFIG_ACK — DB first, then broadcast result ────────
                     if etype == "CONFIG_ACK":
