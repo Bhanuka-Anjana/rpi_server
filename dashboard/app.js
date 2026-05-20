@@ -37,6 +37,23 @@ function elapsed(ms) {
   return `${Math.floor(s/3600)}h ago`;
 }
 
+function anchorKey(row) {
+  if (!row) return undefined;
+  if (row.anchor_id_str !== undefined) return row.anchor_id_str;
+  if (row.anchor_id !== undefined) return String(row.anchor_id);
+  return undefined;
+}
+
+function anchorLabel(row) {
+  return row?.eui || anchorKey(row) || "—";
+}
+
+function storeAnchor(row) {
+  const id = anchorKey(row);
+  if (id !== undefined) anchors[id] = row;
+  return id;
+}
+
 // ── State ─────────────────────────────────────────────────────────────
 
 let tags         = {};   // uid → tag_state row
@@ -83,7 +100,7 @@ function renderTags() {
   tbody.innerHTML = rows.map(t => `
     <tr>
       <td>0x${t.uid.toString(16).toUpperCase().padStart(4,"0")}</td>
-      <td>${t.nearest_anchor ?? "—"}</td>
+      <td>${t.nearest_anchor_eui || t.nearest_anchor || "—"}</td>
       <td>${t.dist_cm ?? "—"}</td>
       <td>${gearPill(t.gear ?? 0)}</td>
       <td>${t.escort ? '<span class="pill escort">YES</span>' : "—"}</td>
@@ -109,11 +126,12 @@ function renderDoors() {
   const now = Date.now();
   const rows = Object.values(anchors);
   container.innerHTML = rows.map(a => {
+    const id = anchorKey(a);
     const isOnline = a.last_heartbeat_ms && (now - a.last_heartbeat_ms) < 120000;
     return `
     <div class="door-card${isOnline ? "" : " offline"}">
-      <h3>Anchor ${a.anchor_id} — ${a.location_label || "Door"}
-        <button class="btn-remove" data-anchor-id="${a.anchor_id}" title="Remove anchor">✕</button>
+      <h3>Anchor ${anchorLabel(a)} — ${a.location_label || "Door"}
+        <button class="btn-remove" data-anchor-id="${id}" title="Remove anchor">✕</button>
       </h3>
       <div class="indicator">
         <span class="dot ${a.locked ? "on" : "green"}"></span>
@@ -150,11 +168,11 @@ function renderDoors() {
           <span class="ota-badge ota-${(a.ota_status || 'idle').toLowerCase()}">${a.ota_status || 'IDLE'}</span>
         </div>
         <div class="ota-controls">
-          <select class="ota-fw-select" data-anchor-id="${a.anchor_id}">
+          <select class="ota-fw-select" data-anchor-id="${id}">
             <option value="">— select version —</option>
             ${firmwareList.map(f => `<option value="${f.id}">${f.version}</option>`).join("")}
           </select>
-          <button class="btn-ota" data-anchor-id="${a.anchor_id}"
+          <button class="btn-ota" data-anchor-id="${id}"
                   ${a.ota_status === 'IN_PROGRESS' ? 'disabled' : ''}>
             ${a.ota_status === 'IN_PROGRESS' ? 'Updating…' : 'Push OTA'}
           </button>
@@ -189,7 +207,7 @@ function renderAlerts() {
   tbody.innerHTML = alerts.slice(0, 50).map(e => `
     <tr class="alert-row">
       <td>${formatTime(e.ts_ms)}</td>
-      <td>${e.anchor_id}</td>
+      <td>${anchorLabel(e)}</td>
       <td><b>${e.type}</b></td>
       <td>${e.tag_uid ? `0x${e.tag_uid.toString(16).toUpperCase().padStart(4,"0")}` : "—"}</td>
       <td>${e.dist_cm ? e.dist_cm + " cm" : "—"}</td>
@@ -203,13 +221,13 @@ function renderEvents() {
   const rows   = events.filter(e =>
     !filter ||
     e.type?.toLowerCase().includes(filter) ||
-    String(e.anchor_id).includes(filter)
+    anchorLabel(e).toLowerCase().includes(filter)
   ).slice(0, 100);
 
   tbody.innerHTML = rows.map(e => `
     <tr>
       <td>${formatTime(e.ts_ms)}</td>
-      <td>${e.anchor_id}</td>
+      <td>${anchorLabel(e)}</td>
       <td>${e.type}</td>
       <td>${e.tag_uid ? `0x${e.tag_uid.toString(16).toUpperCase().padStart(4,"0")}` : "—"}</td>
       <td>${e.dist_cm ?? "—"}</td>
@@ -244,7 +262,7 @@ document.getElementById("filter-input").addEventListener("input", renderEvents);
 document.getElementById("door-cards").addEventListener("click", e => {
   const removeBtn = e.target.closest(".btn-remove[data-anchor-id]");
   if (removeBtn) {
-    const id = parseInt(removeBtn.dataset.anchorId);
+    const id = removeBtn.dataset.anchorId;
     if (!confirm(`Remove Anchor ${id} from the server?\nThis cannot be undone unless the anchor reconnects.`)) return;
     fetch(`/api/anchor/${id}`, { method: "DELETE" })
       .then(() => { delete anchors[id]; renderDoors(); renderStatus(); });
@@ -334,33 +352,33 @@ function connect() {
     if (msg.type === "_snapshot") {
       // Initial state dump from server
       msg.tags.forEach(t    => { tags[t.uid]           = t; });
-      msg.anchors.forEach(a => { anchors[a.anchor_id]  = a; });
+      msg.anchors.forEach(a => { storeAnchor(a); });
       renderAll();
       return;
     }
 
     if (msg.type === "_anchor_removed") {
-      delete anchors[msg.anchor_id];
+      delete anchors[anchorKey(msg)];
       scheduleRender();
       return;
     }
 
     if (msg.type === "_config_update") {
-      const id = msg.anchor_id;
+      const id = anchorKey(msg);
       if (anchors[id]) Object.assign(anchors[id], msg);
       scheduleRender();
       return;
     }
 
     if (msg.type === "OTA_PROGRESS") {
-      const id = msg.anchor_id;
+      const id = anchorKey(msg);
       if (anchors[id]) { anchors[id].ota_status = "IN_PROGRESS"; anchors[id].ota_percent = msg.percent; }
       scheduleRender();
       return;
     }
 
     if (msg.type === "OTA_COMPLETE") {
-      const id = msg.anchor_id;
+      const id = anchorKey(msg);
       if (anchors[id]) {
         anchors[id].ota_status  = "COMPLETE";
         anchors[id].ota_percent = 100;
@@ -371,17 +389,17 @@ function connect() {
     }
 
     if (msg.type === "OTA_FAILED") {
-      const id = msg.anchor_id;
+      const id = anchorKey(msg);
       if (anchors[id]) { anchors[id].ota_status = "FAILED"; anchors[id].ota_percent = 0; }
       scheduleRender();
       return;
     }
 
     // Live event — update state
-    const id    = msg.anchor_id;
+    const id    = anchorKey(msg);
     const etype = msg.type || "";
 
-    if (id !== undefined && !anchors[id]) anchors[id] = { anchor_id: id };
+    if (id !== undefined && !anchors[id]) anchors[id] = { anchor_id: msg.anchor_id, anchor_id_str: id };
     if (id !== undefined) anchors[id].last_heartbeat_ms = msg.ts_ms;
 
     if (etype === "EVT_DOOR_LOCKED")   { if (anchors[id]) anchors[id].locked = 1; }
@@ -439,7 +457,7 @@ Promise.all([
   fetchWithTimeout("/api/firmware"),
 ]).then(([t, a, ev, al, fw]) => {
   t.forEach(tag   => { tags[tag.uid]            = tag; });
-  a.forEach(anch  => { anchors[anch.anchor_id]  = anch; });
+  a.forEach(anch  => { storeAnchor(anch); });
   events = ev;
   alerts = al;
   firmwareList = fw;

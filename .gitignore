@@ -4,7 +4,7 @@ __pycache__/
 *.pyo
 
 # Virtual environment
-venv/
+.venv/
 
 # Database — runtime file, not source
 *.db
