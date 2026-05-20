@@ -465,17 +465,48 @@ function renderRoomMap(room) {
     `;
   }).join("");
 
+  const tagR    = Math.max(8,  Math.min(w, h) * 0.014);
+  const distSz  = Math.max(10, Math.min(w, h) * 0.020);
+
   const tagSvg = Object.values(tags).filter(t =>
     Number(t.room_id) === Number(room.id) &&
     t.global_x_cm !== undefined && t.global_x_cm !== null &&
     t.global_y_cm !== undefined && t.global_y_cm !== null
   ).map(t => {
-    const x = clamp(Number(t.global_x_cm), 0, w);
-    const y = clamp(Number(t.global_y_cm), 0, h);
+    const tx   = clamp(Number(t.global_x_cm), 0, w);
+    const ty   = clamp(Number(t.global_y_cm), 0, h);
+    const tsy  = h - ty;   // SVG y (flipped)
+
+    // Find the anchor that produced this ranging.
+    // source_anchor_id_str is the authoritative string key (avoids JS integer precision loss).
+    // Fall back to nearest_anchor (also a string anchor_id_str).
+    const srcId = t.source_anchor_id_str || t.nearest_anchor || String(t.source_anchor ?? "");
+    const src   = srcId ? (room.anchors || []).find(
+      a => (a.anchor_id_str && a.anchor_id_str === srcId) ||
+           String(a.anchor_id) === srcId ||
+           String(a.uwb_short_id) === srcId
+    ) : null;
+
+    let rangingLine = "";
+    if (src) {
+      const ax  = clamp(Number(src.room_x_cm || 0), 0, w);
+      const asy = h - clamp(Number(src.room_y_cm || 0), 0, h);
+      const mx  = (tx + ax) / 2;
+      const my  = (tsy + asy) / 2;
+      rangingLine = `
+        <line stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="6,4" stroke-opacity="0.85"
+              x1="${tx}" y1="${tsy}" x2="${ax}" y2="${asy}" />
+        ${t.dist_cm != null ? `
+        <text fill="#f59e0b" font-size="${distSz}" font-weight="bold" text-anchor="middle"
+              x="${mx}" y="${my - 4}">${t.dist_cm} cm</text>` : ""}
+      `;
+    }
+
     return `
       <g class="map-tag">
-        <circle cx="${x}" cy="${h - y}" r="${Math.max(8, Math.min(w, h) * 0.014)}" />
-        <text x="${x + 12}" y="${h - y + 4}">0x${Number(t.uid).toString(16).toUpperCase().padStart(4, "0")}</text>
+        ${rangingLine}
+        <circle cx="${tx}" cy="${tsy}" r="${tagR}" />
+        <text x="${tx + tagR + 4}" y="${tsy + 4}">0x${Number(t.uid).toString(16).toUpperCase().padStart(4, "0")}</text>
       </g>
     `;
   }).join("");
@@ -1006,8 +1037,9 @@ function connect() {
     if (etype === "EVT_FIRE_CLEARED")  { if (anchors[id]) anchors[id].fire   = 0; }
 
     if (msg.tag_uid !== undefined) {
+      const prev = tags[msg.tag_uid] || {};
       tags[msg.tag_uid] = {
-        ...(tags[msg.tag_uid] || {}),
+        ...prev,
         uid:            msg.tag_uid,
         nearest_anchor: id,
         dist_cm:        msg.dist_cm,
@@ -1017,7 +1049,9 @@ function connect() {
         room_name:      msg.room_name,
         global_x_cm:    msg.global_x_cm,
         global_y_cm:    msg.global_y_cm,
-        source_anchor:  msg.source_anchor,
+        // keep previous source_anchor fields if this event doesn't carry them
+        source_anchor:        msg.source_anchor        ?? prev.source_anchor,
+        source_anchor_id_str: msg.source_anchor_id_str ?? prev.source_anchor_id_str,
         gear:           msg.gear,
         escort:         msg.escort,
         last_seen_ms:   msg.ts_ms,
@@ -1029,6 +1063,7 @@ function connect() {
       twrDebug.unshift(msg);
       if (twrDebug.length > TWR_DEBUG_LIMIT) twrDebug.length = TWR_DEBUG_LIMIT;
       scheduleTwrDebugRender();
+      scheduleTagsRender();   // also refresh room map so dotted line updates
       return;
     }
 
