@@ -6,7 +6,7 @@ import json
 import time
 from pathlib import Path
 
-from fastapi import FastAPI, Request, UploadFile, File, Form
+from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -85,6 +85,55 @@ async def get_tags():
 @app.get("/api/anchors")
 async def get_anchors():
     return db.get_all_anchors()
+
+
+@app.get("/api/rooms")
+async def get_rooms():
+    return db.get_rooms()
+
+
+@app.post("/api/rooms")
+async def create_room(request: Request):
+    room = db.create_room(await request.json())
+    broadcast_event({"type": "_rooms_update", "rooms": db.get_rooms(),
+                     "ts_ms": int(time.time() * 1000)})
+    return room
+
+
+@app.put("/api/rooms/{room_id}")
+async def update_room(room_id: int, request: Request):
+    room = db.update_room(room_id, await request.json())
+    if room is None:
+        raise HTTPException(status_code=404, detail="room not found")
+    broadcast_event({"type": "_rooms_update", "rooms": db.get_rooms(),
+                     "ts_ms": int(time.time() * 1000)})
+    return room
+
+
+@app.delete("/api/rooms/{room_id}")
+async def delete_room(room_id: int):
+    db.delete_room(room_id)
+    broadcast_event({"type": "_rooms_update", "rooms": db.get_rooms(),
+                     "ts_ms": int(time.time() * 1000)})
+    return {"status": "deleted", "id": room_id}
+
+
+@app.put("/api/rooms/{room_id}/anchors/{anchor_id}")
+async def set_room_anchor(room_id: int, anchor_id: int, request: Request):
+    item = db.upsert_room_anchor(room_id, anchor_id, await request.json())
+    if item is None:
+        raise HTTPException(status_code=404, detail="room not found")
+    broadcast_event({"type": "_rooms_update", "rooms": db.get_rooms(),
+                     "ts_ms": int(time.time() * 1000)})
+    return item
+
+
+@app.delete("/api/rooms/anchors/{anchor_id}")
+async def remove_room_anchor(anchor_id: int):
+    db.delete_room_anchor(anchor_id)
+    broadcast_event({"type": "_rooms_update", "rooms": db.get_rooms(),
+                     "ts_ms": int(time.time() * 1000)})
+    return {"status": "deleted", "anchor_id": anchor_id, "anchor_id_str": str(anchor_id)}
 
 
 @app.get("/api/events")
@@ -232,6 +281,7 @@ async def event_stream():
                 "type": "_snapshot",
                 "tags": db.get_all_tags(),
                 "anchors": db.get_all_anchors(),
+                "rooms": db.get_rooms(),
             }
             yield f"data: {json.dumps(snapshot)}\n\n"
 

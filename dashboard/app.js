@@ -68,20 +68,58 @@ function boolLabel(value) {
   return Number(value) ? "YES" : "NO";
 }
 
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, ch => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    "\"": "&quot;",
+    "'": "&#39;",
+  }[ch]));
+}
+
 function storeAnchor(row) {
   const id = anchorKey(row);
   if (id !== undefined) anchors[id] = row;
   return id;
 }
 
+function anchorDisplayById(id) {
+  const row = anchors[String(id)] || anchors[id];
+  return row ? anchorLabel(row) : String(id ?? "-");
+}
+
+function numberOrBlank(value) {
+  return value === undefined || value === null ? "" : String(value);
+}
+
+function roomAnchorFor(anchorId) {
+  const key = String(anchorId);
+  for (const room of rooms) {
+    const match = (room.anchors || []).find(a => String(a.anchor_id_str || a.anchor_id) === key);
+    if (match) return { room, anchor: match };
+  }
+  return null;
+}
+
+function selectedRoom() {
+  if (!rooms.length) return null;
+  if (!selectedRoomId || !rooms.some(r => String(r.id) === String(selectedRoomId))) {
+    selectedRoomId = rooms[0].id;
+  }
+  return rooms.find(r => String(r.id) === String(selectedRoomId)) || rooms[0];
+}
+
 // ── State ─────────────────────────────────────────────────────────────
 
 let tags         = {};   // uid → tag_state row
 let anchors      = {};   // anchor_id → anchor row
+let rooms        = [];    // configured rooms and room-anchor mappings
 let events       = [];   // recent events (capped at 200)
 let alerts       = [];   // alert events
 let firmwareList = [];   // [{id, version, filename, size_bytes, sha256, uploaded_ms}]
 let twrDebug     = [];   // recent raw TWR samples shown in the debug tab
+let selectedRoomId = null;
 
 // ── Render throttling ─────────────────────────────────────────────────
 // Coalesce rapid SSE bursts: at most one DOM rebuild per animation frame.
@@ -104,6 +142,7 @@ function scheduleTagsRender() {
   requestAnimationFrame(() => {
     _tagsRenderPending = false;
     renderTags();
+    renderRooms();
     renderStatus();
   });
 }
@@ -117,6 +156,7 @@ function scheduleTwrDebugRender() {
     _twrRenderPending = false;
     renderTags();
     renderTwrDebug();
+    renderRooms();
     renderStatus();
   });
 }
@@ -302,6 +342,125 @@ function renderTwrDebug() {
   }).join("") || '<tr><td colspan="13" style="color:#6b7280">No TWR samples</td></tr>';
 }
 
+function renderRooms() {
+  const container = document.getElementById("room-admin");
+  if (!container) return;
+
+  const room = selectedRoom();
+  const roomOptions = rooms.map(r =>
+    `<option value="${r.id}" ${room && r.id === room.id ? "selected" : ""}>${esc(r.name)}</option>`
+  ).join("");
+  const anchorOptions = Object.values(anchors).map(a => {
+    const id = anchorKey(a);
+    const mapped = roomAnchorFor(id);
+    const suffix = mapped ? ` (${mapped.room.name})` : "";
+    return `<option value="${id}">${esc(anchorLabel(a))}${esc(suffix)}</option>`;
+  }).join("");
+
+  const preview = room ? renderRoomPreview(room) : '<div class="room-empty">Create a room to preview anchors and tags.</div>';
+  const mappings = room ? (room.anchors || []) : [];
+
+  container.innerHTML = `
+    <div class="room-grid">
+      <div class="room-panel">
+        <h3>Create Room</h3>
+        <div class="room-form compact">
+          <input id="room-new-name" placeholder="Room name" />
+          <input id="room-new-width" type="number" min="100" placeholder="Width cm" />
+          <input id="room-new-height" type="number" min="100" placeholder="Height cm" />
+          <button id="room-create-btn">Create</button>
+        </div>
+
+        <h3>Selected Room</h3>
+        ${rooms.length ? `
+        <div class="room-form">
+          <select id="room-select">${roomOptions}</select>
+          <input id="room-edit-name" value="${esc(room.name)}" />
+          <input id="room-edit-width" type="number" min="100" value="${room.width_cm}" />
+          <input id="room-edit-height" type="number" min="100" value="${room.height_cm}" />
+          <button id="room-save-btn">Save</button>
+          <button id="room-delete-btn" class="danger">Delete</button>
+        </div>
+
+        <h3>Assign Anchor</h3>
+        <div class="room-form anchor-form">
+          <select id="room-anchor-select">${anchorOptions || '<option value="">No anchors</option>'}</select>
+          <input id="room-anchor-uwb" type="number" min="0" max="65535" placeholder="UWB short ID" />
+          <input id="room-anchor-x" type="number" placeholder="X cm" />
+          <input id="room-anchor-y" type="number" placeholder="Y cm" />
+          <input id="room-anchor-heading" type="number" step="0.1" placeholder="Heading deg" />
+          <input id="room-anchor-radius" type="number" min="1" placeholder="Danger radius" />
+          <label class="room-check"><input id="room-anchor-enabled" type="checkbox" checked /> Lock</label>
+          <button id="room-anchor-save-btn">Assign</button>
+        </div>
+
+        <table class="room-anchor-table">
+          <thead>
+            <tr><th>Anchor</th><th>UWB</th><th>X</th><th>Y</th><th>Heading</th><th>Radius</th><th>Lock</th><th></th></tr>
+          </thead>
+          <tbody>
+            ${mappings.map(a => `
+              <tr data-room-anchor-id="${a.anchor_id_str || a.anchor_id}">
+                <td>${esc(a.eui || anchorDisplayById(a.anchor_id_str || a.anchor_id))}</td>
+                <td><input data-field="uwb_short_id" type="number" min="0" max="65535" value="${numberOrBlank(a.uwb_short_id)}" /></td>
+                <td><input data-field="room_x_cm" type="number" value="${numberOrBlank(a.room_x_cm)}" /></td>
+                <td><input data-field="room_y_cm" type="number" value="${numberOrBlank(a.room_y_cm)}" /></td>
+                <td><input data-field="heading_deg" type="number" step="0.1" value="${numberOrBlank(a.heading_deg)}" /></td>
+                <td><input data-field="danger_radius_cm" type="number" min="1" value="${numberOrBlank(a.danger_radius_cm)}" /></td>
+                <td><input data-field="lock_enabled" type="checkbox" ${a.lock_enabled ? "checked" : ""} /></td>
+                <td>
+                  <button class="room-row-save">Save</button>
+                  <button class="room-row-remove danger">Remove</button>
+                </td>
+              </tr>
+            `).join("") || '<tr><td colspan="8" style="color:#6b7280">No anchors assigned</td></tr>'}
+          </tbody>
+        </table>` : '<p class="room-empty">No rooms configured.</p>'}
+      </div>
+      <div class="room-panel preview-panel">
+        ${preview}
+      </div>
+    </div>
+  `;
+}
+
+function renderRoomPreview(room) {
+  const w = Math.max(1, Number(room.width_cm || 1));
+  const h = Math.max(1, Number(room.height_cm || 1));
+  const anchorsHtml = (room.anchors || []).map(a => {
+    const x = Number(a.room_x_cm || 0);
+    const y = Number(a.room_y_cm || 0);
+    const r = Number(a.danger_radius_cm || 0);
+    return `
+      <div class="danger-zone" style="left:${((x - r) / w) * 100}%;bottom:${((y - r) / h) * 100}%;width:${(2 * r / w) * 100}%;height:${(2 * r / h) * 100}%"></div>
+      <div class="room-anchor-dot" style="left:${(x / w) * 100}%;bottom:${(y / h) * 100}%" title="${esc(a.eui || anchorDisplayById(a.anchor_id_str || a.anchor_id))}">
+        <span>${hex16(a.uwb_short_id)}</span>
+      </div>
+    `;
+  }).join("");
+  const tagsHtml = Object.values(tags).filter(t =>
+    Number(t.room_id) === Number(room.id) &&
+    t.global_x_cm !== undefined && t.global_x_cm !== null &&
+    t.global_y_cm !== undefined && t.global_y_cm !== null
+  ).map(t => `
+    <div class="room-tag-dot" style="left:${(Number(t.global_x_cm) / w) * 100}%;bottom:${(Number(t.global_y_cm) / h) * 100}%"
+         title="0x${Number(t.uid).toString(16).toUpperCase().padStart(4, "0")}">
+      T
+    </div>
+  `).join("");
+
+  return `
+    <div class="room-preview-head">
+      <b>${esc(room.name)}</b>
+      <span>${room.width_cm} x ${room.height_cm} cm</span>
+    </div>
+    <div class="room-preview" style="aspect-ratio:${w}/${h}">
+      ${anchorsHtml}
+      ${tagsHtml}
+    </div>
+  `;
+}
+
 function renderStatus() {
   const now    = Date.now();
   const online = Object.values(anchors).filter(
@@ -317,6 +476,7 @@ function renderStatus() {
 function renderAll() {
   renderTags();
   renderDoors();
+  renderRooms();
   renderAlerts();
   renderTwrDebug();
   renderEvents();
@@ -328,6 +488,98 @@ document.getElementById("filter-input").addEventListener("input", renderEvents);
 document.getElementById("twr-clear-btn").addEventListener("click", () => {
   twrDebug = [];
   renderTwrDebug();
+});
+
+document.getElementById("room-admin").addEventListener("change", e => {
+  if (e.target.id === "room-select") {
+    selectedRoomId = Number(e.target.value);
+    renderRooms();
+  }
+});
+
+document.getElementById("room-admin").addEventListener("click", e => {
+  const room = selectedRoom();
+
+  if (e.target.id === "room-create-btn") {
+    const body = {
+      name: document.getElementById("room-new-name").value.trim() || "Room",
+      width_cm: Number(document.getElementById("room-new-width").value || 500),
+      height_cm: Number(document.getElementById("room-new-height").value || 500),
+    };
+    fetch("/api/rooms", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body) })
+      .then(r => r.json())
+      .then(created => { selectedRoomId = created.id; return fetch("/api/rooms"); })
+      .then(r => r.json())
+      .then(list => { rooms = list; renderRooms(); });
+    return;
+  }
+
+  if (!room) return;
+
+  if (e.target.id === "room-save-btn") {
+    const body = {
+      name: document.getElementById("room-edit-name").value.trim() || room.name,
+      width_cm: Number(document.getElementById("room-edit-width").value || room.width_cm),
+      height_cm: Number(document.getElementById("room-edit-height").value || room.height_cm),
+    };
+    fetch(`/api/rooms/${room.id}`, { method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body) })
+      .then(() => fetch("/api/rooms"))
+      .then(r => r.json())
+      .then(list => { rooms = list; renderRooms(); });
+    return;
+  }
+
+  if (e.target.id === "room-delete-btn") {
+    if (!confirm(`Delete room ${room.name}?`)) return;
+    fetch(`/api/rooms/${room.id}`, { method: "DELETE" })
+      .then(() => fetch("/api/rooms"))
+      .then(r => r.json())
+      .then(list => { rooms = list; selectedRoomId = rooms[0]?.id || null; renderRooms(); });
+    return;
+  }
+
+  if (e.target.id === "room-anchor-save-btn") {
+    const anchorId = document.getElementById("room-anchor-select").value;
+    if (!anchorId) return;
+    const body = {
+      uwb_short_id: document.getElementById("room-anchor-uwb").value,
+      room_x_cm: Number(document.getElementById("room-anchor-x").value || 0),
+      room_y_cm: Number(document.getElementById("room-anchor-y").value || 0),
+      heading_deg: Number(document.getElementById("room-anchor-heading").value || 0),
+      danger_radius_cm: Number(document.getElementById("room-anchor-radius").value || 300),
+      lock_enabled: document.getElementById("room-anchor-enabled").checked ? 1 : 0,
+    };
+    fetch(`/api/rooms/${room.id}/anchors/${anchorId}`, {
+      method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)
+    }).then(() => fetch("/api/rooms"))
+      .then(r => r.json())
+      .then(list => { rooms = list; renderRooms(); });
+    return;
+  }
+
+  const row = e.target.closest("tr[data-room-anchor-id]");
+  if (!row) return;
+  const anchorId = row.dataset.roomAnchorId;
+
+  if (e.target.classList.contains("room-row-save")) {
+    const body = {};
+    row.querySelectorAll("[data-field]").forEach(input => {
+      body[input.dataset.field] = input.type === "checkbox" ? (input.checked ? 1 : 0) : input.value;
+    });
+    fetch(`/api/rooms/${room.id}/anchors/${anchorId}`, {
+      method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)
+    }).then(() => fetch("/api/rooms"))
+      .then(r => r.json())
+      .then(list => { rooms = list; renderRooms(); });
+    return;
+  }
+
+  if (e.target.classList.contains("room-row-remove")) {
+    fetch(`/api/rooms/anchors/${anchorId}`, { method: "DELETE" })
+      .then(() => fetch("/api/rooms"))
+      .then(r => r.json())
+      .then(list => { rooms = list; renderRooms(); });
+  }
 });
 
 // Remove-anchor button delegation
@@ -425,7 +677,16 @@ function connect() {
       // Initial state dump from server
       msg.tags.forEach(t    => { tags[t.uid]           = t; });
       msg.anchors.forEach(a => { storeAnchor(a); });
+      rooms = msg.rooms || [];
+      selectedRoomId = rooms[0]?.id || selectedRoomId;
       renderAll();
+      return;
+    }
+
+    if (msg.type === "_rooms_update") {
+      rooms = msg.rooms || [];
+      selectedRoomId = rooms[0]?.id || selectedRoomId;
+      scheduleRender();
       return;
     }
 
@@ -487,6 +748,11 @@ function connect() {
         dist_cm:        msg.dist_cm,
         x_cm:           msg.x_cm,
         y_cm:           msg.y_cm,
+        room_id:        msg.room_id,
+        room_name:      msg.room_name,
+        global_x_cm:    msg.global_x_cm,
+        global_y_cm:    msg.global_y_cm,
+        source_anchor:  msg.source_anchor,
         gear:           msg.gear,
         escort:         msg.escort,
         last_seen_ms:   msg.ts_ms,
@@ -536,12 +802,15 @@ Promise.all([
   fetchWithTimeout("/api/events?limit=100"),
   fetchWithTimeout("/api/alerts?limit=50"),
   fetchWithTimeout("/api/firmware"),
-]).then(([t, a, ev, al, fw]) => {
+  fetchWithTimeout("/api/rooms"),
+]).then(([t, a, ev, al, fw, roomList]) => {
   t.forEach(tag   => { tags[tag.uid]            = tag; });
   a.forEach(anch  => { storeAnchor(anch); });
   events = ev;
   alerts = al;
   firmwareList = fw;
+  rooms = roomList || [];
+  selectedRoomId = rooms[0]?.id || null;
   renderAll();
   connect();
 }).catch(() => connect());  // Still open SSE even if REST fails or times out

@@ -18,7 +18,7 @@ def _from_db(n: int) -> int:
     return n if n >= 0 else n + 0x10000000000000000
 
 def _fix_row(d: dict) -> dict:
-    for key in ("anchor_id", "nearest_anchor"):
+    for key in ("anchor_id", "nearest_anchor", "source_anchor"):
         if key in d and d[key] is not None:
             d[key] = _from_db(d[key])
     return d
@@ -61,6 +61,10 @@ def init_db():
                 dist_cm          INTEGER,
                 x_cm             INTEGER,
                 y_cm             INTEGER,
+                room_id          INTEGER,
+                global_x_cm      INTEGER,
+                global_y_cm      INTEGER,
+                source_anchor    INTEGER,
                 gear             INTEGER,
                 escort           INTEGER DEFAULT 0,
                 last_seen_ms     INTEGER
@@ -132,6 +136,37 @@ def init_db():
             )
         """)
 
+        # Room layout used by the local server for coordinate-based lock decisions.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS rooms (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                name       TEXT    NOT NULL,
+                width_cm   INTEGER NOT NULL,
+                height_cm  INTEGER NOT NULL,
+                created_ms INTEGER NOT NULL,
+                updated_ms INTEGER NOT NULL
+            )
+        """)
+
+        # One physical anchor belongs to one room. uwb_short_id maps the UART
+        # anchor_short_id from the co-processor to the configured room anchor.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS room_anchors (
+                anchor_id        INTEGER PRIMARY KEY,
+                room_id          INTEGER NOT NULL,
+                uwb_short_id     INTEGER,
+                room_x_cm        INTEGER NOT NULL DEFAULT 0,
+                room_y_cm        INTEGER NOT NULL DEFAULT 0,
+                heading_deg      REAL    NOT NULL DEFAULT 0,
+                danger_radius_cm INTEGER NOT NULL DEFAULT 300,
+                lock_enabled     INTEGER NOT NULL DEFAULT 1,
+                updated_ms       INTEGER NOT NULL,
+                FOREIGN KEY(room_id) REFERENCES rooms(id) ON DELETE CASCADE
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_room_anchors_room ON room_anchors(room_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_room_anchors_uwb_short ON room_anchors(uwb_short_id)")
+
         # Migrations — add columns introduced after initial deployment
         for migration in [
             "ALTER TABLE anchor_config ADD COLUMN tz TEXT DEFAULT '+0:00'",
@@ -140,6 +175,10 @@ def init_db():
             "ALTER TABLE anchor_config ADD COLUMN wifi_count INTEGER DEFAULT 0",
             "ALTER TABLE tag_state ADD COLUMN x_cm INTEGER DEFAULT NULL",
             "ALTER TABLE tag_state ADD COLUMN y_cm INTEGER DEFAULT NULL",
+            "ALTER TABLE tag_state ADD COLUMN room_id INTEGER DEFAULT NULL",
+            "ALTER TABLE tag_state ADD COLUMN global_x_cm INTEGER DEFAULT NULL",
+            "ALTER TABLE tag_state ADD COLUMN global_y_cm INTEGER DEFAULT NULL",
+            "ALTER TABLE tag_state ADD COLUMN source_anchor INTEGER DEFAULT NULL",
             "ALTER TABLE anchors ADD COLUMN boot_count INTEGER DEFAULT 0",
             "ALTER TABLE anchors ADD COLUMN fw_version  TEXT    DEFAULT NULL",
             "ALTER TABLE anchors ADD COLUMN ota_status  TEXT    DEFAULT 'IDLE'",
@@ -205,21 +244,37 @@ def upsert_anchor(anchor_id: int, anchor_type: int = None, boot_count: int = Non
 
 def upsert_tag_state(uid: int, anchor_id: int, dist_cm: int,
                      gear: int = None, escort: int = 0,
-                     x_cm: int = None, y_cm: int = None):
+                     x_cm: int = None, y_cm: int = None,
+                     room_id: int = None,
+                     global_x_cm: int = None, global_y_cm: int = None,
+                     source_anchor: int = None):
+    source_db = _to_db(source_anchor) if source_anchor is not None else None
     with _lock:
         conn = get_conn()
         conn.execute("""
-            INSERT INTO tag_state (uid, nearest_anchor, dist_cm, x_cm, y_cm, gear, escort, last_seen_ms)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO tag_state (
+                uid, nearest_anchor, dist_cm, x_cm, y_cm,
+                room_id, global_x_cm, global_y_cm, source_anchor,
+                gear, escort, last_seen_ms
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(uid) DO UPDATE SET
                 nearest_anchor = excluded.nearest_anchor,
                 dist_cm        = excluded.dist_cm,
                 x_cm           = COALESCE(excluded.x_cm, x_cm),
                 y_cm           = COALESCE(excluded.y_cm, y_cm),
+                room_id        = COALESCE(excluded.room_id, room_id),
+                global_x_cm    = COALESCE(excluded.global_x_cm, global_x_cm),
+                global_y_cm    = COALESCE(excluded.global_y_cm, global_y_cm),
+                source_anchor  = COALESCE(excluded.source_anchor, source_anchor),
                 gear           = COALESCE(excluded.gear, gear),
                 escort         = excluded.escort,
                 last_seen_ms   = excluded.last_seen_ms
-        """, (uid, _to_db(anchor_id), dist_cm, x_cm, y_cm, gear, escort, int(time.time() * 1000)))
+        """, (
+            uid, _to_db(anchor_id), dist_cm, x_cm, y_cm,
+            room_id, global_x_cm, global_y_cm, source_db,
+            gear, escort, int(time.time() * 1000)
+        ))
         conn.commit()
         conn.close()
 
@@ -284,9 +339,13 @@ def get_all_tags() -> list:
     with _lock:
         conn = get_conn()
         rows = conn.execute("""
-            SELECT t.*, a.eui AS nearest_anchor_eui
+            SELECT t.*, a.eui AS nearest_anchor_eui,
+                   sa.eui AS source_anchor_eui,
+                   r.name AS room_name
             FROM tag_state t
             LEFT JOIN anchors a ON t.nearest_anchor = a.anchor_id
+            LEFT JOIN anchors sa ON t.source_anchor = sa.anchor_id
+            LEFT JOIN rooms r ON t.room_id = r.id
             ORDER BY t.last_seen_ms DESC
         """).fetchall()
         conn.close()
@@ -320,6 +379,210 @@ def get_all_anchors() -> list:
 
 
 # ── Config parameter bounds ────────────────────────────────────────────
+def _room_row(row) -> dict:
+    return dict(row)
+
+
+def _room_anchor_row(row) -> dict:
+    d = _fix_row(dict(row))
+    if d.get("anchor_id") is not None:
+        d["anchor_id_str"] = str(d["anchor_id"])
+    return d
+
+
+def _clamp_room_payload(params: dict, existing: dict | None = None) -> dict:
+    existing = existing or {}
+    name = str(params.get("name", existing.get("name", "Room"))).strip() or "Room"
+    width_cm = max(100, int(params.get("width_cm", existing.get("width_cm", 500))))
+    height_cm = max(100, int(params.get("height_cm", existing.get("height_cm", 500))))
+    return {"name": name[:80], "width_cm": width_cm, "height_cm": height_cm}
+
+
+def _clamp_room_anchor_payload(params: dict, existing: dict | None = None) -> dict:
+    existing = existing or {}
+
+    def _int(name, default, min_value=None, max_value=None):
+        val = int(params.get(name, existing.get(name, default)))
+        if min_value is not None:
+            val = max(min_value, val)
+        if max_value is not None:
+            val = min(max_value, val)
+        return val
+
+    uwb_raw = params.get("uwb_short_id", existing.get("uwb_short_id"))
+    uwb_short_id = None if uwb_raw in (None, "") else max(0, min(0xFFFF, int(uwb_raw)))
+    enabled_raw = params.get("lock_enabled", existing.get("lock_enabled", 1))
+    lock_enabled = 0 if str(enabled_raw).lower() in ("0", "false", "off", "no", "") else 1
+    return {
+        "uwb_short_id": uwb_short_id,
+        "room_x_cm": _int("room_x_cm", 0),
+        "room_y_cm": _int("room_y_cm", 0),
+        "heading_deg": float(params.get("heading_deg", existing.get("heading_deg", 0.0))),
+        "danger_radius_cm": _int("danger_radius_cm", 300, 1),
+        "lock_enabled": lock_enabled,
+    }
+
+
+def get_rooms() -> list:
+    with _lock:
+        conn = get_conn()
+        room_rows = conn.execute("SELECT * FROM rooms ORDER BY id").fetchall()
+        anchor_rows = conn.execute("""
+            SELECT ra.*, a.eui, a.location_label
+            FROM room_anchors ra
+            LEFT JOIN anchors a ON ra.anchor_id = a.anchor_id
+            ORDER BY ra.room_id, ra.anchor_id
+        """).fetchall()
+        conn.close()
+
+    rooms = [_room_row(r) for r in room_rows]
+    by_id = {r["id"]: r for r in rooms}
+    for room in rooms:
+        room["anchors"] = []
+    for row in anchor_rows:
+        item = _room_anchor_row(row)
+        room = by_id.get(item.get("room_id"))
+        if room is not None:
+            room["anchors"].append(item)
+    return rooms
+
+
+def get_room(room_id: int) -> dict | None:
+    target = int(room_id)
+    for room in get_rooms():
+        if room["id"] == target:
+            return room
+    return None
+
+
+def create_room(params: dict) -> dict:
+    safe = _clamp_room_payload(params)
+    now_ms = int(time.time() * 1000)
+    with _lock:
+        conn = get_conn()
+        cur = conn.execute("""
+            INSERT INTO rooms (name, width_cm, height_cm, created_ms, updated_ms)
+            VALUES (?, ?, ?, ?, ?)
+        """, (safe["name"], safe["width_cm"], safe["height_cm"], now_ms, now_ms))
+        room_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+    return get_room(room_id)
+
+
+def update_room(room_id: int, params: dict) -> dict | None:
+    existing = get_room(room_id)
+    if not existing:
+        return None
+    safe = _clamp_room_payload(params, existing)
+    with _lock:
+        conn = get_conn()
+        conn.execute("""
+            UPDATE rooms SET name = ?, width_cm = ?, height_cm = ?, updated_ms = ?
+            WHERE id = ?
+        """, (safe["name"], safe["width_cm"], safe["height_cm"],
+              int(time.time() * 1000), int(room_id)))
+        conn.commit()
+        conn.close()
+    return get_room(room_id)
+
+
+def delete_room(room_id: int):
+    with _lock:
+        conn = get_conn()
+        conn.execute("DELETE FROM room_anchors WHERE room_id = ?", (int(room_id),))
+        conn.execute("DELETE FROM rooms WHERE id = ?", (int(room_id),))
+        conn.commit()
+        conn.close()
+
+
+def upsert_room_anchor(room_id: int, anchor_id: int, params: dict) -> dict | None:
+    if get_room(room_id) is None:
+        return None
+
+    existing = get_room_anchor_by_anchor_id(anchor_id)
+    safe = _clamp_room_anchor_payload(params, existing)
+    now_ms = int(time.time() * 1000)
+    with _lock:
+        conn = get_conn()
+        conn.execute("""
+            INSERT INTO room_anchors (
+                anchor_id, room_id, uwb_short_id, room_x_cm, room_y_cm,
+                heading_deg, danger_radius_cm, lock_enabled, updated_ms
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(anchor_id) DO UPDATE SET
+                room_id = excluded.room_id,
+                uwb_short_id = excluded.uwb_short_id,
+                room_x_cm = excluded.room_x_cm,
+                room_y_cm = excluded.room_y_cm,
+                heading_deg = excluded.heading_deg,
+                danger_radius_cm = excluded.danger_radius_cm,
+                lock_enabled = excluded.lock_enabled,
+                updated_ms = excluded.updated_ms
+        """, (
+            _to_db(anchor_id), int(room_id), safe["uwb_short_id"], safe["room_x_cm"],
+            safe["room_y_cm"], safe["heading_deg"], safe["danger_radius_cm"],
+            safe["lock_enabled"], now_ms
+        ))
+        conn.commit()
+        conn.close()
+    return get_room_anchor_by_anchor_id(anchor_id)
+
+
+def delete_room_anchor(anchor_id: int):
+    with _lock:
+        conn = get_conn()
+        conn.execute("DELETE FROM room_anchors WHERE anchor_id = ?", (_to_db(anchor_id),))
+        conn.commit()
+        conn.close()
+
+
+def get_room_anchor_by_anchor_id(anchor_id: int) -> dict | None:
+    with _lock:
+        conn = get_conn()
+        row = conn.execute("""
+            SELECT ra.*, r.name AS room_name, r.width_cm, r.height_cm, a.eui, a.location_label
+            FROM room_anchors ra
+            JOIN rooms r ON ra.room_id = r.id
+            LEFT JOIN anchors a ON ra.anchor_id = a.anchor_id
+            WHERE ra.anchor_id = ?
+        """, (_to_db(anchor_id),)).fetchone()
+        conn.close()
+    return _room_anchor_row(row) if row else None
+
+
+def get_room_anchor_by_uwb_short_id(uwb_short_id: int) -> dict | None:
+    with _lock:
+        conn = get_conn()
+        row = conn.execute("""
+            SELECT ra.*, r.name AS room_name, r.width_cm, r.height_cm, a.eui, a.location_label
+            FROM room_anchors ra
+            JOIN rooms r ON ra.room_id = r.id
+            LEFT JOIN anchors a ON ra.anchor_id = a.anchor_id
+            WHERE ra.uwb_short_id = ?
+            ORDER BY ra.updated_ms DESC
+            LIMIT 1
+        """, (int(uwb_short_id),)).fetchone()
+        conn.close()
+    return _room_anchor_row(row) if row else None
+
+
+def get_room_anchors(room_id: int) -> list:
+    with _lock:
+        conn = get_conn()
+        rows = conn.execute("""
+            SELECT ra.*, r.name AS room_name, r.width_cm, r.height_cm, a.eui, a.location_label
+            FROM room_anchors ra
+            JOIN rooms r ON ra.room_id = r.id
+            LEFT JOIN anchors a ON ra.anchor_id = a.anchor_id
+            WHERE ra.room_id = ?
+            ORDER BY ra.anchor_id
+        """, (int(room_id),)).fetchall()
+        conn.close()
+    return [_room_anchor_row(r) for r in rows]
+
+
 # WIFI_MAX_NETWORKS must match WIFI_MAX_NETWORKS in anchor firmware (wifi_manager.h)
 WIFI_MAX_NETWORKS = 3
 
@@ -550,6 +813,7 @@ def deregister_anchor(anchor_id: int):
         conn.execute("DELETE FROM anchors        WHERE anchor_id = ?", (db_id,))
         conn.execute("DELETE FROM door_state     WHERE anchor_id = ?", (db_id,))
         conn.execute("DELETE FROM anchor_config  WHERE anchor_id = ?", (db_id,))
+        conn.execute("DELETE FROM room_anchors   WHERE anchor_id = ?", (db_id,))
         conn.commit()
         conn.close()
 

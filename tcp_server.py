@@ -16,6 +16,7 @@
 import asyncio
 import json
 import logging
+import math
 import ssl
 import threading
 import time
@@ -353,8 +354,13 @@ def _prune_anchor_twr_tags(anchor_id: int, now_ms: int) -> dict[int, dict]:
 
 def _anchor_has_in_range_tag(anchor_id: int, threshold: int, now_ms: int) -> bool:
     tags = _prune_anchor_twr_tags(anchor_id, now_ms)
-    return any(int(sample.get("dist_cm", 65535)) <= threshold
-               for sample in tags.values())
+    for sample in tags.values():
+        if "in_zone" in sample:
+            if sample.get("in_zone"):
+                return True
+        elif int(sample.get("dist_cm", 65535)) <= threshold:
+            return True
+    return False
 
 
 async def _schedule_anchor_twr_expiry(anchor_id: int):
@@ -411,6 +417,154 @@ async def _anchor_twr_expiry_worker(anchor_id: int, expiry_ms: int):
             _anchor_twr_expiry_tasks.pop(anchor_id, None)
 
 
+def _resolve_room_source_anchor(reporting_anchor_id: int, evt: dict) -> dict | None:
+    """Return the room anchor used as the x/y coordinate source."""
+    anchor_short_id = evt.get("anchor_short_id")
+    if anchor_short_id is not None:
+        try:
+            mapped = db.get_room_anchor_by_uwb_short_id(int(anchor_short_id))
+        except (TypeError, ValueError):
+            mapped = None
+        if mapped is not None:
+            return mapped
+
+    return db.get_room_anchor_by_anchor_id(reporting_anchor_id)
+
+
+def _apply_room_transform(source: dict, evt: dict) -> tuple[int, int] | None:
+    x_cm = evt.get("x_cm")
+    y_cm = evt.get("y_cm")
+    if x_cm is None or y_cm is None:
+        return None
+
+    try:
+        local_x = float(x_cm)
+        local_y = float(y_cm)
+        anchor_x = float(source.get("room_x_cm") or 0)
+        anchor_y = float(source.get("room_y_cm") or 0)
+        theta = math.radians(float(source.get("heading_deg") or 0))
+    except (TypeError, ValueError):
+        return None
+
+    cos_t = math.cos(theta)
+    sin_t = math.sin(theta)
+    global_x = anchor_x + local_x * cos_t - local_y * sin_t
+    global_y = anchor_y + local_x * sin_t + local_y * cos_t
+    return int(round(global_x)), int(round(global_y))
+
+
+def _room_lock_targets(source: dict, global_x_cm: int, global_y_cm: int) -> list[dict]:
+    targets = []
+    for candidate in db.get_room_anchors(int(source["room_id"])):
+        if not int(candidate.get("lock_enabled") or 0):
+            continue
+        radius = int(candidate.get("danger_radius_cm") or 0)
+        dx = int(global_x_cm) - int(candidate.get("room_x_cm") or 0)
+        dy = int(global_y_cm) - int(candidate.get("room_y_cm") or 0)
+        dist_sq = dx * dx + dy * dy
+        targets.append({
+            **candidate,
+            "zone_dist_cm": int(round(math.sqrt(dist_sq))),
+            "in_zone": dist_sq <= radius * radius,
+        })
+    return targets
+
+
+async def _apply_room_twr_lock_decision(reporting_anchor_id: int, evt: dict) -> bool:
+    source = _resolve_room_source_anchor(reporting_anchor_id, evt)
+    if source is None:
+        return False
+
+    pos = _apply_room_transform(source, evt)
+    if pos is None:
+        return False
+
+    global_x_cm, global_y_cm = pos
+    room_id = int(source["room_id"])
+    room_targets = _room_lock_targets(source, global_x_cm, global_y_cm)
+    if not room_targets:
+        return False
+
+    now_ms = int(time.time() * 1000)
+    tag_uid = int(evt["tag_uid"])
+
+    evt["room_id"] = room_id
+    evt["room_name"] = source.get("room_name")
+    evt["global_x_cm"] = global_x_cm
+    evt["global_y_cm"] = global_y_cm
+    evt["source_anchor"] = source.get("anchor_id")
+    evt["source_anchor_id_str"] = source.get("anchor_id_str")
+    evt["source_anchor_eui"] = source.get("eui")
+    evt["lock_mode"] = "ROOM_ZONE"
+    evt["lock_window_ms"] = _LOCK_STATE_HOLD_MS
+    evt["lock_renew_ms"] = _LOCK_STATE_RENEW_MS
+    evt["lock_expiry_owner"] = "anchor"
+    evt["lock_command_sent"] = False
+    evt["lock_targets"] = []
+
+    sent_any = False
+    any_locked = False
+    changed_any = False
+
+    for target in room_targets:
+        target_anchor_id = int(target["anchor_id"])
+        locked = bool(target["in_zone"])
+        any_locked = any_locked or locked
+        previous = _anchor_lock_decision.get(target_anchor_id)
+        changed_any = changed_any or (previous is not locked)
+
+        samples = _anchor_twr_tags.setdefault(target_anchor_id, {})
+        samples[tag_uid] = {
+            "dist_cm": evt.get("dist_cm"),
+            "x_cm": evt.get("x_cm"),
+            "y_cm": evt.get("y_cm"),
+            "global_x_cm": global_x_cm,
+            "global_y_cm": global_y_cm,
+            "room_id": room_id,
+            "zone_dist_cm": target["zone_dist_cm"],
+            "danger_radius_cm": target.get("danger_radius_cm"),
+            "in_zone": locked,
+            "expires_at_ms": now_ms + _TWR_TAG_STALE_MS,
+            "range_num": evt.get("range_num"),
+            "escort": evt.get("escort", 0),
+        }
+
+        await _schedule_anchor_twr_expiry(target_anchor_id)
+
+        target_info = {
+            "anchor_id": target_anchor_id,
+            "anchor_id_str": str(target_anchor_id),
+            "eui": target.get("eui"),
+            "room_x_cm": target.get("room_x_cm"),
+            "room_y_cm": target.get("room_y_cm"),
+            "danger_radius_cm": target.get("danger_radius_cm"),
+            "zone_dist_cm": target["zone_dist_cm"],
+            "decision": "LOCK" if locked else "UNLOCK",
+            "command_sent": False,
+        }
+
+        if not locked:
+            if previous is True:
+                _anchor_lock_decision[target_anchor_id] = False
+            evt["lock_targets"].append(target_info)
+            continue
+
+        last_sent_ms = _anchor_lock_last_sent_ms.get(target_anchor_id, 0)
+        should_send = previous is not True or (now_ms - last_sent_ms) >= _LOCK_STATE_RENEW_MS
+        if should_send and await _push_lock_state(target_anchor_id, True, evt):
+            _anchor_lock_decision[target_anchor_id] = True
+            _anchor_lock_last_sent_ms[target_anchor_id] = now_ms
+            sent_any = True
+            target_info["command_sent"] = True
+
+        evt["lock_targets"].append(target_info)
+
+    evt["lock_decision"] = "LOCK" if any_locked else "UNLOCK"
+    evt["lock_decision_changed"] = changed_any
+    evt["lock_command_sent"] = sent_any
+    return True
+
+
 async def _apply_twr_lock_decision(anchor_id: int, evt: dict):
     """Server-owned distance and freshness decision for raw TWR samples."""
     if evt.get("type") != "EVT_TWR_SAMPLE":
@@ -428,6 +582,11 @@ async def _apply_twr_lock_decision(anchor_id: int, evt: dict):
         tag_uid = int(tag_uid)
         dist_cm = int(dist_cm)
     except (TypeError, ValueError):
+        return
+    evt["tag_uid"] = tag_uid
+    evt["dist_cm"] = dist_cm
+
+    if await _apply_room_twr_lock_decision(anchor_id, evt):
         return
 
     threshold = _anchor_lock_distance_cm.get(anchor_id)
@@ -451,6 +610,7 @@ async def _apply_twr_lock_decision(anchor_id: int, evt: dict):
     previous = _anchor_lock_decision.get(anchor_id)
 
     evt["lock_threshold_cm"] = threshold
+    evt["lock_mode"] = "DISTANCE_FALLBACK"
     evt["lock_window_ms"] = _LOCK_STATE_HOLD_MS
     evt["lock_renew_ms"] = _LOCK_STATE_RENEW_MS
     evt["lock_expiry_owner"] = "anchor"
@@ -525,7 +685,11 @@ def _persist_event(evt: dict):
                 if should_write:
                     db.upsert_tag_state(tag_uid, anchor_id, evt.get("dist_cm"),
                                         gear=evt.get("gear"), escort=evt.get("escort", 0),
-                                        x_cm=evt.get("x_cm"), y_cm=evt.get("y_cm"))
+                                        x_cm=evt.get("x_cm"), y_cm=evt.get("y_cm"),
+                                        room_id=evt.get("room_id"),
+                                        global_x_cm=evt.get("global_x_cm"),
+                                        global_y_cm=evt.get("global_y_cm"),
+                                        source_anchor=evt.get("source_anchor"))
         elif etype == "EVT_HEARTBEAT":
             db.upsert_anchor(anchor_id)
         return None

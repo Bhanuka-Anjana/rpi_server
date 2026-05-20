@@ -193,6 +193,135 @@ tbody tr:hover { background: #1a1d27; }
                  font-size:0.72rem; border-radius:4px; padding:2px 4px; flex:1;
                  min-width:0; }
 
+/* Rooms tab */
+.room-grid {
+  display: grid;
+  grid-template-columns: minmax(520px, 1.2fr) minmax(360px, 0.8fr);
+  gap: 16px;
+  align-items: start;
+}
+.room-panel {
+  background: #1a1d27;
+  border: 1px solid #2a2d3a;
+  border-radius: 8px;
+  padding: 16px;
+}
+.room-panel h3 {
+  font-size: 0.85rem;
+  color: #9ca3af;
+  margin: 0 0 10px;
+  text-transform: uppercase;
+}
+.room-form {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(90px, 1fr));
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.room-form.compact { grid-template-columns: 1.4fr 1fr 1fr auto; }
+.room-form.anchor-form { grid-template-columns: 1.5fr repeat(5, 1fr) auto auto; }
+.room-form input,
+.room-form select,
+.room-anchor-table input {
+  background: #0f1117;
+  border: 1px solid #2a2d3a;
+  color: #e0e0e0;
+  border-radius: 5px;
+  padding: 6px 8px;
+  min-width: 0;
+}
+.room-form button,
+.room-anchor-table button {
+  background: #1e3a5f;
+  border: 1px solid #2563eb;
+  color: #60a5fa;
+  border-radius: 5px;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+.room-form button:hover,
+.room-anchor-table button:hover { background:#2563eb; color:#fff; }
+.room-form button.danger,
+.room-anchor-table button.danger {
+  background: #3a1717;
+  border-color: #7f1d1d;
+  color: #f87171;
+}
+.room-check {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  color: #9ca3af;
+  font-size: 0.82rem;
+}
+.room-anchor-table { font-size: 0.8rem; }
+.room-anchor-table input[type="number"] { width: 84px; }
+.room-empty { color: #6b7280; font-size: 0.9rem; }
+.room-preview-head {
+  display: flex;
+  justify-content: space-between;
+  color: #9ca3af;
+  font-size: 0.85rem;
+  margin-bottom: 10px;
+}
+.room-preview {
+  position: relative;
+  width: 100%;
+  max-height: 68vh;
+  min-height: 320px;
+  overflow: hidden;
+  background:
+    linear-gradient(#232838 1px, transparent 1px),
+    linear-gradient(90deg, #232838 1px, transparent 1px),
+    #10131c;
+  background-size: 10% 10%;
+  border: 1px solid #374151;
+  border-radius: 6px;
+}
+.danger-zone {
+  position: absolute;
+  border: 1px solid rgba(248, 113, 113, 0.75);
+  background: rgba(127, 29, 29, 0.18);
+  border-radius: 50%;
+  transform: none;
+}
+.room-anchor-dot,
+.room-tag-dot {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  transform: translate(-50%, 50%);
+  border-radius: 50%;
+  border: 2px solid #0f1117;
+}
+.room-anchor-dot {
+  background: #60a5fa;
+  box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.25);
+}
+.room-anchor-dot span {
+  position: absolute;
+  left: 16px;
+  top: -5px;
+  white-space: nowrap;
+  color: #9ca3af;
+  font-size: 0.72rem;
+}
+.room-tag-dot {
+  background: #fbbf24;
+  color: #111827;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.65rem;
+  font-weight: 700;
+}
+@media (max-width: 1100px) {
+  .room-grid { grid-template-columns: 1fr; }
+  .room-form,
+  .room-form.compact,
+  .room-form.anchor-form { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
+}
+
 /* Firmware tab */
 #fw-upload-area { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:16px; }
 #fw-version-input { background:#1a1d27; border:1px solid #2a2d3a; color:#e0e0e0;
