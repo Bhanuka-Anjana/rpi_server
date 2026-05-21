@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>WMS — Local Dashboard</title>
   <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/gridstack@10/dist/gridstack.min.css" />
 </head>
 <body>
   <header>
@@ -53,7 +54,19 @@
   <!-- Rooms Tab -->
   <section id="tab-rooms" class="tab">
     <h2>Room Setup</h2>
-    <div id="room-admin"></div>
+    <div id="room-admin">
+      <div class="grid-stack" id="rooms-grid">
+        <div class="grid-stack-item" gs-w="3" gs-min-w="2" gs-x="0" gs-y="0" gs-h="9">
+          <div class="grid-stack-item-content visual-room-sidebar" id="gs-rooms-sidebar"></div>
+        </div>
+        <div class="grid-stack-item" gs-w="6" gs-min-w="4" gs-x="3" gs-y="0" gs-h="9">
+          <div class="grid-stack-item-content room-map-panel" id="gs-rooms-map"></div>
+        </div>
+        <div class="grid-stack-item" gs-w="3" gs-min-w="2" gs-x="9" gs-y="0" gs-h="9">
+          <div class="grid-stack-item-content visual-room-sidebar inspector" id="gs-rooms-inspector"></div>
+        </div>
+      </div>
+    </div>
   </section>
 
   <!-- Alerts Tab -->
@@ -130,6 +143,7 @@
     </table>
   </section>
 
+  <script src="https://cdn.jsdelivr.net/npm/gridstack@10/dist/gridstack-all.min.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

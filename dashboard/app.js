@@ -357,9 +357,7 @@ function renderTwrDebug() {
 
 function renderRoomMapOnly() {
   if (roomDrag) return;
-  const container = document.getElementById("room-admin");
-  if (!container) return;
-  const mapPanel = container.querySelector(".room-map-panel");
+  const mapPanel = document.getElementById("gs-rooms-map");
   const room = selectedRoom();
   if (mapPanel && room) mapPanel.innerHTML = renderRoomMap(room);
 }
@@ -512,12 +510,12 @@ function renderRoomMap(room) {
   }).join("");
 
   return `
-    <div class="room-map-head">
-      <div>
+    <div class="gs-drag-handle room-map-drag-handle">
+      <div class="room-map-head-info">
         <b>${esc(room.name)}</b>
         <span>${room.width_cm} x ${room.height_cm} cm</span>
       </div>
-      <span>${placingAnchorId ? "Click the map to place anchor" : "Drag ○ to move · drag red □ to set x-axis · drag green □ to set y-axis"}</span>
+      <span class="room-map-hint">${placingAnchorId ? "Click the map to place anchor" : "Drag ○ to move · red □ = x-axis · green □ = y-axis"}</span>
     </div>
     <svg id="room-map-svg" class="room-map-svg" viewBox="0 0 ${w} ${h}"
          data-room-id="${room.id}" preserveAspectRatio="xMidYMid meet">
@@ -537,12 +535,15 @@ function renderRoomMap(room) {
 }
 
 function renderRooms() {
-  const container = document.getElementById("room-admin");
-  if (!container || roomDrag) return;
+  const sidebar   = document.getElementById("gs-rooms-sidebar");
+  const mapPanel  = document.getElementById("gs-rooms-map");
+  const inspector = document.getElementById("gs-rooms-inspector");
+  if (!sidebar || !mapPanel || !inspector || roomDrag) return;
 
-  // Don't clobber inspector inputs while user is editing — just refresh the map.
-  if (container.contains(document.activeElement) &&
-      document.activeElement.tagName === "INPUT") {
+  // Don't clobber inspector/sidebar inputs while user is editing — just refresh the map.
+  const active = document.activeElement;
+  if (active && active.tagName === "INPUT" &&
+      (sidebar.contains(active) || inspector.contains(active))) {
     renderRoomMapOnly();
     return;
   }
@@ -551,45 +552,42 @@ function renderRooms() {
   const selectedAnchor = roomAnchorById(room, selectedRoomAnchorId);
   const unassignedAnchors = Object.values(anchors).filter(a => !roomAnchorFor(anchorKey(a)));
 
-  container.innerHTML = `
-    <div class="visual-room-layout">
-      <aside class="visual-room-sidebar">
-        <div class="room-sidebar-head">
-          <h3>Rooms</h3>
-          <button id="visual-room-create-btn">New</button>
-        </div>
-        <div class="room-list">
-          ${rooms.map(r => `
-            <button class="room-list-item${room && r.id === room.id ? " active" : ""}" data-room-id="${r.id}">
-              <span>${esc(r.name)}</span>
-              <small>${r.width_cm} x ${r.height_cm} cm</small>
-            </button>
-          `).join("") || '<p class="room-empty">No rooms configured</p>'}
-        </div>
-        ${room ? `
-          <div class="room-actions">
-            <button id="visual-room-edit-btn">Edit Size</button>
-            <button id="visual-room-delete-btn" class="danger">Delete</button>
-          </div>
-        ` : ""}
-        <h3>Place Anchors</h3>
-        <div class="anchor-palette">
-          ${unassignedAnchors.map(a => {
-            const id = anchorKey(a);
-            return `<button class="anchor-chip${String(placingAnchorId) === String(id) ? " active" : ""}" data-place-anchor="${id}">${esc(anchorLabel(a))}</button>`;
-          }).join("") || '<p class="room-empty">All known anchors are placed</p>'}
-        </div>
-      </aside>
-
-      <section class="room-map-panel">
-        ${room ? renderRoomMap(room) : '<div class="room-map-empty">Create a room to start visual setup.</div>'}
-      </section>
-
-      <aside class="visual-room-sidebar inspector">
-        ${room ? renderRoomInspector(room, selectedAnchor) : '<p class="room-empty">No room selected</p>'}
-      </aside>
+  sidebar.innerHTML = `
+    <div class="gs-drag-handle">Rooms</div>
+    <div class="room-sidebar-head">
+      <h3>Rooms</h3>
+      <button id="visual-room-create-btn">New</button>
+    </div>
+    <div class="room-list">
+      ${rooms.map(r => `
+        <button class="room-list-item${room && r.id === room.id ? " active" : ""}" data-room-id="${r.id}">
+          <span>${esc(r.name)}</span>
+          <small>${r.width_cm} x ${r.height_cm} cm</small>
+        </button>
+      `).join("") || '<p class="room-empty">No rooms configured</p>'}
+    </div>
+    ${room ? `
+      <div class="room-actions">
+        <button id="visual-room-edit-btn">Edit Size</button>
+        <button id="visual-room-delete-btn" class="danger">Delete</button>
+      </div>
+    ` : ""}
+    <h3>Place Anchors</h3>
+    <div class="anchor-palette">
+      ${unassignedAnchors.map(a => {
+        const id = anchorKey(a);
+        return `<button class="anchor-chip${String(placingAnchorId) === String(id) ? " active" : ""}" data-place-anchor="${id}">${esc(anchorLabel(a))}</button>`;
+      }).join("") || '<p class="room-empty">All known anchors are placed</p>'}
     </div>
   `;
+
+  mapPanel.innerHTML = room
+    ? renderRoomMap(room)
+    : '<div class="room-map-empty">Create a room to start visual setup.</div>';
+
+  inspector.innerHTML = `<div class="gs-drag-handle">Inspector</div>` + (room
+    ? renderRoomInspector(room, selectedAnchor)
+    : '<p class="room-empty">No room selected</p>');
 }
 
 function renderStatus() {
@@ -1125,6 +1123,18 @@ Promise.all([
   renderAll();
   connect();
 }).catch(() => connect());  // Still open SSE even if REST fails or times out
+
+// ── Gridstack — resizable room panels ─────────────────────────────────
+GridStack.init({
+  el:         "#rooms-grid",
+  column:     12,
+  cellHeight: 70,
+  margin:     8,
+  animate:    true,
+  float:      false,
+  resizable:  { handles: "e,w" },
+  draggable:  { handle: ".gs-drag-handle" },
+});
 
 // Re-render elapsed times every 10 s
 setInterval(renderAll, 10000);
