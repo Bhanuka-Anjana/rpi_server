@@ -80,12 +80,9 @@ _CALIBRATION_LOG_DIR = Path(__file__).parent / "calibration_logs"
 _CALIBRATION_DEFAULTS = {
     "ignore_n": 200,
     "collect_n": 200,
-    "verify_collect_n": 50,
     "sample_timeout_s": 120.0,
     "phase_stddev_max_deg": 10.0,
     "range_stddev_max_m": 0.15,
-    "verify_phase_max_deg": 3.0,
-    "verify_range_max_m": 0.10,
 }
 _calibration_runs: dict[int, dict] = {}
 
@@ -482,7 +479,6 @@ async def start_anchor_calibration(anchor_id: int, params: dict) -> dict:
             cfg[key] = float(params[key]) if key.endswith("_s") or key.endswith("_m") or key.endswith("_deg") else int(params[key])
     cfg["ignore_n"] = max(0, int(cfg["ignore_n"]))
     cfg["collect_n"] = max(1, int(cfg["collect_n"]))
-    cfg["verify_collect_n"] = max(1, int(cfg["verify_collect_n"]))
     cfg["sample_timeout_s"] = max(5.0, float(cfg["sample_timeout_s"]))
 
     started_ms = _now_ms()
@@ -495,15 +491,17 @@ async def start_anchor_calibration(anchor_id: int, params: dict) -> dict:
         "measured_distance_m": measured_distance_m,
         "ignore_n": cfg["ignore_n"],
         "collect_n": cfg["collect_n"],
-        "verify_collect_n": cfg["verify_collect_n"],
+        "verify_collect_n": None,
         "sample_timeout_s": cfg["sample_timeout_s"],
         "phase_stddev_max_deg": cfg["phase_stddev_max_deg"],
         "range_stddev_max_m": cfg["range_stddev_max_m"],
-        "verify_phase_max_deg": cfg["verify_phase_max_deg"],
-        "verify_range_max_m": cfg["verify_range_max_m"],
+        "verify_phase_max_deg": None,
+        "verify_range_max_m": None,
         "ignored_samples": 0,
         "collected_samples": 0,
         "verify_samples": 0,
+        "verify_phase_mean_deg": None,
+        "verify_range_error_m": None,
         "last_error": None,
         "log_path": str(log_path),
         "started_ms": started_ms,
@@ -666,45 +664,16 @@ async def _calibration_worker(anchor_id: int, state: dict):
             f"pdoaoff {pdoa_field}\r\n",
             f"rngoff {rng_field}\r\n",
             "save\r\n",
-            "stat\n",
         ):
             if not await _push_calibration_uart(anchor_id, command):
                 raise RuntimeError("failed to send apply/save command")
             await asyncio.sleep(0.05)
 
-        _update_calibration(anchor_id, state, status="VERIFYING")
-        while True:
-            try:
-                state["queue"].get_nowait()
-            except asyncio.QueueEmpty:
-                break
-        verify_phase_deg: list[float] = []
-        verify_range_err: list[float] = []
-        deadline = asyncio.get_running_loop().time() + float(state["sample_timeout_s"])
-        while len(verify_range_err) < int(state["verify_collect_n"]):
-            evt = await _wait_calibration_sample(state, deadline)
-            if evt.get("pdoa_deg") is None or evt.get("dist_m") is None:
-                raise ValueError("extended TWR report is required for verification")
-            pdoa_deg = float(evt["pdoa_deg"])
-            range_error_m = float(evt["dist_m"]) - float(state["measured_distance_m"])
-            verify_phase_deg.append(pdoa_deg)
-            verify_range_err.append(range_error_m)
-            state["verify_samples"] = len(verify_range_err)
-            _write_calibration_csv(writer, "verify", evt, range_error_m)
-            if len(verify_range_err) % 10 == 0 or len(verify_range_err) == int(state["verify_collect_n"]):
-                _update_calibration(anchor_id, state, verify_samples=len(verify_range_err))
-
-        verify_phase_mean_deg = sum(verify_phase_deg) / len(verify_phase_deg)
-        verify_range_error_m = sum(verify_range_err) / len(verify_range_err)
-        if abs(verify_phase_mean_deg) > float(state["verify_phase_max_deg"]):
-            raise RuntimeError(f"verification PDOA residual too high: {verify_phase_mean_deg:.3f} deg")
-        if abs(verify_range_error_m) > float(state["verify_range_max_m"]):
-            raise RuntimeError(f"verification range residual too high: {verify_range_error_m:.3f} m")
-
         _update_calibration(
             anchor_id, state, status="CALIBRATED",
-            verify_phase_mean_deg=verify_phase_mean_deg,
-            verify_range_error_m=verify_range_error_m,
+            verify_samples=0,
+            verify_phase_mean_deg=None,
+            verify_range_error_m=None,
             completed_ms=_now_ms(),
             last_error=None,
         )

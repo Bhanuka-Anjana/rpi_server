@@ -365,7 +365,7 @@ function statusPill(status) {
   const s = status || "IDLE";
   const cls = s === "CALIBRATED" ? "cal-ok" :
               s === "FAILED" || s === "ABORTED" ? "cal-fail" :
-              ["STARTING", "CLEARING", "WARMUP", "COLLECTING", "APPLYING", "VERIFYING"].includes(s) ? "cal-run" :
+              ["STARTING", "CLEARING", "WARMUP", "COLLECTING", "APPLYING"].includes(s) ? "cal-run" :
               "cal-idle";
   return `<span class="pill ${cls}">${esc(s)}</span>`;
 }
@@ -404,7 +404,7 @@ function renderCalibration() {
 
   tbody.innerHTML = rows.map(c => {
     const id = calibrationKey(c);
-    const samples = `${c.ignored_samples ?? 0}/${c.collected_samples ?? 0}/${c.verify_samples ?? 0}`;
+    const samples = `${c.ignored_samples ?? 0}/${c.collected_samples ?? 0}`;
     const tag = c.tag_uid !== undefined && c.tag_uid !== null
       ? `0x${Number(c.tag_uid).toString(16).toUpperCase().padStart(4, "0")}` : "-";
     return `
@@ -417,11 +417,10 @@ function renderCalibration() {
       <td>${c.pdoa_deg ?? "-"}${c.phase_correction_rad !== undefined && c.phase_correction_rad !== null ? ` / ${fmtNum(c.phase_correction_rad, 4, " rad")}` : ""}</td>
       <td>${c.rng_mm ?? "-"}${c.range_correction_m !== undefined && c.range_correction_m !== null ? ` / ${fmtNum(c.range_correction_m, 4, " m")}` : ""}</td>
       <td>${fmtNum(c.phase_stddev_deg, 2, " deg")} / ${fmtNum(c.range_stddev_m, 3, " m")}</td>
-      <td>${fmtNum(c.verify_phase_mean_deg, 2, " deg")} / ${fmtNum(c.verify_range_error_m, 3, " m")}</td>
       <td>${elapsed(c.updated_ms)}</td>
       <td class="cal-error">${esc(c.last_error || "")}</td>
     </tr>`;
-  }).join("") || '<tr><td colspan="11" style="color:#6b7280">No anchors registered</td></tr>';
+  }).join("") || '<tr><td colspan="10" style="color:#6b7280">No anchors registered</td></tr>';
 }
 
 function renderRoomMapOnly() {
@@ -713,7 +712,6 @@ document.getElementById("cal-start-btn").addEventListener("click", () => {
     measured_distance_m: distance,
     ignore_n: Number(document.getElementById("cal-ignore-input").value || 200),
     collect_n: Number(document.getElementById("cal-collect-input").value || 200),
-    verify_collect_n: Number(document.getElementById("cal-verify-input").value || 50),
     sample_timeout_s: Number(document.getElementById("cal-timeout-input").value || 120),
   };
   status.textContent = "Starting calibration...";
