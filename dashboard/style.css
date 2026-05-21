@@ -411,39 +411,14 @@ tbody tr:hover { background: #1a1d27; }
   border: 1px solid #2a2d3a;
   border-radius: 8px;
   padding: 14px;
-  min-height: 520px;
+  display: flex;
+  flex-direction: column;
 }
 .room-map-empty {
-  min-height: 480px;
+  flex: 1;
   display: grid;
   place-items: center;
   color: #6b7280;
-}
-.room-map-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  color: #9ca3af;
-  font-size: 0.82rem;
-  margin-bottom: 10px;
-}
-.room-map-head div {
-  display: grid;
-  gap: 2px;
-}
-.room-map-head b {
-  color: #e0e0e0;
-  font-size: 0.95rem;
-}
-.room-map-svg {
-  width: 100%;
-  height: min(68vh, 680px);
-  min-height: 440px;
-  display: block;
-  border: 1px solid #374151;
-  border-radius: 6px;
-  background: #10131c;
-  touch-action: none;
 }
 .map-floor {
   fill: #10131c;
@@ -528,6 +503,70 @@ tbody tr:hover { background: #1a1d27; }
 @media (max-width: 1180px) {
   .visual-room-layout { grid-template-columns: 1fr; }
   .visual-room-sidebar { min-height: auto; }
+}
+
+/* ── Gridstack dark theme overrides ─────────────────────────────────── */
+.grid-stack {
+  background: transparent;
+}
+.grid-stack-item-content {
+  border-radius: 8px;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+/* resize handle strips */
+.grid-stack-item > .ui-resizable-e,
+.grid-stack-item > .ui-resizable-w {
+  width: 6px;
+  background: transparent;
+  transition: background 0.15s;
+}
+.grid-stack-item > .ui-resizable-e:hover,
+.grid-stack-item > .ui-resizable-w:hover {
+  background: rgba(96, 165, 250, 0.35);
+}
+/* drag handle strip at top of each panel */
+.gs-drag-handle {
+  cursor: grab;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0 8px;
+  color: #4b5563;
+  font-size: 0.7rem;
+  user-select: none;
+}
+.gs-drag-handle::before {
+  content: "⠿⠿";
+  letter-spacing: 2px;
+  font-size: 0.9rem;
+  color: #374151;
+}
+.gs-drag-handle:hover { color: #6b7280; }
+.gs-drag-handle:hover::before { color: #6b7280; }
+.room-map-drag-handle {
+  justify-content: space-between;
+  padding: 4px 0 6px;
+}
+.room-map-drag-handle .room-map-head-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.room-map-drag-handle .room-map-head-info b { color: #e0e0e0; font-size: 0.95rem; }
+.room-map-drag-handle .room-map-head-info span,
+.room-map-drag-handle .room-map-hint { color: #6b7280; font-size: 0.78rem; }
+
+/* SVG map fills the Gridstack panel (panel is abs-positioned by Gridstack) */
+.room-map-svg {
+  width: 100%;
+  height: calc(100% - 54px);
+  min-height: 360px;
+  display: block;
+  border: 1px solid #374151;
+  border-radius: 6px;
+  background: #10131c;
+  touch-action: none;
 }
 
 /* Firmware tab */

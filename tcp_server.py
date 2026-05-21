@@ -446,6 +446,11 @@ def _apply_room_transform(source: dict, evt: dict) -> tuple[int, int] | None:
     except (TypeError, ValueError):
         return None
 
+    if source.get("flip_x"):
+        local_x = -local_x
+    if source.get("flip_y"):
+        local_y = -local_y
+
     cos_t = math.cos(theta)
     sin_t = math.sin(theta)
     global_x = anchor_x + local_x * cos_t - local_y * sin_t
