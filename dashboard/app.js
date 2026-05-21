@@ -121,6 +121,7 @@ function clamp(value, min, max) {
 
 // ── State ─────────────────────────────────────────────────────────────
 
+const EMA_ALPHA  = 0.15;  // position smoothing (lower = smoother, more lag)
 let tags         = {};   // uid → tag_state row
 let anchors      = {};   // anchor_id → anchor row
 let rooms        = [];    // configured rooms and room-anchor mappings
@@ -470,11 +471,10 @@ function renderRoomMap(room) {
 
   const tagSvg = Object.values(tags).filter(t =>
     Number(t.room_id) === Number(room.id) &&
-    t.global_x_cm !== undefined && t.global_x_cm !== null &&
-    t.global_y_cm !== undefined && t.global_y_cm !== null
+    t.sx_cm !== undefined && t.sx_cm !== null
   ).map(t => {
-    const tx   = clamp(Number(t.global_x_cm), 0, w);
-    const ty   = clamp(Number(t.global_y_cm), 0, h);
+    const tx   = clamp(Math.round(t.sx_cm), 0, w);
+    const ty   = clamp(Math.round(t.sy_cm), 0, h);
     const tsy  = h - ty;   // SVG y (flipped)
 
     // Find the anchor that produced this ranging.
@@ -1038,6 +1038,15 @@ function connect() {
 
     if (msg.tag_uid !== undefined) {
       const prev = tags[msg.tag_uid] || {};
+
+      // EMA position smoothing — only when a new raw position arrives
+      let sx = prev.sx_cm, sy = prev.sy_cm;
+      if (msg.global_x_cm !== undefined && msg.global_x_cm !== null) {
+        const rx = Number(msg.global_x_cm), ry = Number(msg.global_y_cm);
+        sx = (sx === undefined) ? rx : EMA_ALPHA * rx + (1 - EMA_ALPHA) * sx;
+        sy = (sy === undefined) ? ry : EMA_ALPHA * ry + (1 - EMA_ALPHA) * sy;
+      }
+
       tags[msg.tag_uid] = {
         ...prev,
         uid:            msg.tag_uid,
@@ -1049,6 +1058,8 @@ function connect() {
         room_name:      msg.room_name,
         global_x_cm:    msg.global_x_cm,
         global_y_cm:    msg.global_y_cm,
+        sx_cm:          sx,
+        sy_cm:          sy,
         // keep previous source_anchor fields if this event doesn't carry them
         source_anchor:        msg.source_anchor        ?? prev.source_anchor,
         source_anchor_id_str: msg.source_anchor_id_str ?? prev.source_anchor_id_str,
