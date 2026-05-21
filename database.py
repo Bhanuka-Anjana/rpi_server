@@ -167,6 +167,41 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_room_anchors_room ON room_anchors(room_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_room_anchors_uwb_short ON room_anchors(uwb_short_id)")
 
+        # Latest calibration result/status per anchor. Raw sample CSV files are
+        # written next to the server under calibration_logs/ and referenced here.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS anchor_calibration (
+                anchor_id                INTEGER PRIMARY KEY,
+                status                   TEXT    NOT NULL DEFAULT 'IDLE',
+                tag_uid                  INTEGER,
+                measured_distance_m      REAL,
+                ignore_n                 INTEGER,
+                collect_n                INTEGER,
+                verify_collect_n         INTEGER,
+                sample_timeout_s         REAL,
+                phase_stddev_max_deg     REAL,
+                range_stddev_max_m       REAL,
+                verify_phase_max_deg     REAL,
+                verify_range_max_m       REAL,
+                ignored_samples          INTEGER DEFAULT 0,
+                collected_samples        INTEGER DEFAULT 0,
+                verify_samples           INTEGER DEFAULT 0,
+                phase_correction_rad     REAL,
+                pdoa_deg                 INTEGER,
+                range_correction_m       REAL,
+                rng_mm                   INTEGER,
+                phase_stddev_deg         REAL,
+                range_stddev_m           REAL,
+                verify_phase_mean_deg    REAL,
+                verify_range_error_m     REAL,
+                last_error               TEXT,
+                log_path                 TEXT,
+                started_ms               INTEGER,
+                updated_ms               INTEGER,
+                completed_ms             INTEGER
+            )
+        """)
+
         # Migrations — add columns introduced after initial deployment
         for migration in [
             "ALTER TABLE anchor_config ADD COLUMN tz TEXT DEFAULT '+0:00'",
@@ -196,6 +231,69 @@ def init_db():
         conn.commit()
         conn.close()
         print("[DB] Initialised")
+
+
+def _calibration_row(row) -> dict:
+    d = _fix_row(dict(row))
+    if d.get("anchor_id") is not None:
+        d["anchor_id_str"] = str(d["anchor_id"])
+    return d
+
+
+def upsert_anchor_calibration(anchor_id: int, fields: dict) -> dict:
+    """Insert/update latest calibration status for an anchor."""
+    allowed = {
+        "status", "tag_uid", "measured_distance_m", "ignore_n", "collect_n",
+        "verify_collect_n", "sample_timeout_s", "phase_stddev_max_deg",
+        "range_stddev_max_m", "verify_phase_max_deg", "verify_range_max_m",
+        "ignored_samples", "collected_samples", "verify_samples",
+        "phase_correction_rad", "pdoa_deg", "range_correction_m", "rng_mm",
+        "phase_stddev_deg", "range_stddev_m", "verify_phase_mean_deg",
+        "verify_range_error_m", "last_error", "log_path", "started_ms",
+        "updated_ms", "completed_ms",
+    }
+    safe = {k: v for k, v in fields.items() if k in allowed}
+    now_ms = int(time.time() * 1000)
+    safe.setdefault("updated_ms", now_ms)
+    db_id = _to_db(anchor_id)
+
+    with _lock:
+        conn = get_conn()
+        conn.execute(
+            "INSERT OR IGNORE INTO anchor_calibration (anchor_id, updated_ms) VALUES (?, ?)",
+            (db_id, now_ms),
+        )
+        for col, val in safe.items():
+            conn.execute(
+                f"UPDATE anchor_calibration SET {col} = ? WHERE anchor_id = ?",
+                (val, db_id),
+            )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM anchor_calibration WHERE anchor_id = ?", (db_id,)
+        ).fetchone()
+        conn.close()
+    return _calibration_row(row)
+
+
+def get_anchor_calibration(anchor_id: int) -> dict | None:
+    with _lock:
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT * FROM anchor_calibration WHERE anchor_id = ?", (_to_db(anchor_id),)
+        ).fetchone()
+        conn.close()
+    return _calibration_row(row) if row else None
+
+
+def get_all_anchor_calibrations() -> list:
+    with _lock:
+        conn = get_conn()
+        rows = conn.execute(
+            "SELECT * FROM anchor_calibration ORDER BY updated_ms DESC"
+        ).fetchall()
+        conn.close()
+    return [_calibration_row(r) for r in rows]
 
 
 def insert_event(evt: dict) -> int:
@@ -822,6 +920,7 @@ def deregister_anchor(anchor_id: int):
         conn.execute("DELETE FROM anchors        WHERE anchor_id = ?", (db_id,))
         conn.execute("DELETE FROM door_state     WHERE anchor_id = ?", (db_id,))
         conn.execute("DELETE FROM anchor_config  WHERE anchor_id = ?", (db_id,))
+        conn.execute("DELETE FROM anchor_calibration WHERE anchor_id = ?", (db_id,))
         conn.execute("DELETE FROM room_anchors   WHERE anchor_id = ?", (db_id,))
         conn.commit()
         conn.close()

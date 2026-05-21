@@ -578,3 +578,77 @@ tbody tr:hover { background: #1a1d27; }
                   border-radius:6px; padding:7px 16px; font-size:0.88rem; cursor:pointer; }
 #fw-upload-btn:hover { background:#2563eb; color:#fff; }
 #fw-upload-status { font-size:0.82rem; color:#9ca3af; }
+
+/* Calibration tab */
+.calibration-panel {
+  margin-bottom: 16px;
+  border: 1px solid #2a2d3a;
+  border-radius: 8px;
+  background: #151923;
+  padding: 14px;
+}
+.calibration-form {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(160px, 1fr));
+  gap: 8px 12px;
+  align-items: end;
+}
+.calibration-form label {
+  color: #9ca3af;
+  font-size: 0.78rem;
+}
+.calibration-form select,
+.calibration-form input {
+  background:#1a1d27;
+  border:1px solid #2a2d3a;
+  color:#e0e0e0;
+  padding:7px 10px;
+  border-radius:6px;
+}
+.calibration-form details {
+  grid-column: 1 / -1;
+  color: #9ca3af;
+  font-size: 0.82rem;
+}
+.cal-advanced-grid {
+  display: grid;
+  grid-template-columns: repeat(4, auto minmax(80px, 120px));
+  gap: 8px;
+  margin-top: 8px;
+  align-items: center;
+}
+.cal-actions {
+  display: flex;
+  gap: 8px;
+}
+.cal-actions button {
+  background:#1e3a5f;
+  border:1px solid #2563eb;
+  color:#60a5fa;
+  border-radius:6px;
+  padding:7px 16px;
+  cursor:pointer;
+}
+.cal-actions button.danger {
+  background:#3b1f2a;
+  border-color:#7f1d1d;
+  color:#fca5a5;
+}
+#cal-status-msg {
+  color:#9ca3af;
+  font-size:0.82rem;
+}
+.cal-ok { background:#064e3b; color:#86efac; }
+.cal-run { background:#1e3a5f; color:#93c5fd; }
+.cal-fail { background:#7f1d1d; color:#fecaca; }
+.cal-idle { background:#374151; color:#d1d5db; }
+.cal-error {
+  max-width: 260px;
+  color: #fca5a5;
+  font-size: 0.78rem;
+}
+
+@media (max-width: 900px) {
+  .calibration-form { grid-template-columns: 1fr; }
+  .cal-advanced-grid { grid-template-columns: auto 1fr; }
+}

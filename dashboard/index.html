@@ -22,6 +22,7 @@
     <button class="tab-btn" data-tab="doors">Doors</button>
     <button class="tab-btn" data-tab="rooms">Rooms</button>
     <button class="tab-btn" data-tab="alerts">Alerts</button>
+    <button class="tab-btn" data-tab="calibration">Calibration</button>
     <button class="tab-btn" data-tab="twr-debug">TWR Debug</button>
     <button class="tab-btn" data-tab="events">Event Log</button>
     <button class="tab-btn" data-tab="firmware">Firmware</button>
@@ -80,6 +81,53 @@
     </table>
   </section>
 
+  <!-- Calibration Tab -->
+  <section id="tab-calibration" class="tab">
+    <h2>Anchor Calibration</h2>
+    <div class="calibration-panel">
+      <div class="calibration-form">
+        <label>Anchor</label>
+        <select id="cal-anchor-select"></select>
+        <label>Tag</label>
+        <select id="cal-tag-select"></select>
+        <label>Measured distance (m)</label>
+        <input id="cal-distance-input" type="number" min="0.01" step="0.001" placeholder="3.000" />
+        <details>
+          <summary>Advanced</summary>
+          <div class="cal-advanced-grid">
+            <label>Ignore</label><input id="cal-ignore-input" type="number" min="0" value="200" />
+            <label>Collect</label><input id="cal-collect-input" type="number" min="1" value="200" />
+            <label>Verify</label><input id="cal-verify-input" type="number" min="1" value="50" />
+            <label>Timeout (s)</label><input id="cal-timeout-input" type="number" min="5" value="120" />
+          </div>
+        </details>
+        <div class="cal-actions">
+          <button id="cal-start-btn">Start</button>
+          <button id="cal-abort-btn" class="danger">Abort</button>
+        </div>
+        <div id="cal-status-msg"></div>
+      </div>
+    </div>
+    <table id="cal-table">
+      <thead>
+        <tr>
+          <th>Anchor</th>
+          <th>Status</th>
+          <th>Tag</th>
+          <th>Distance</th>
+          <th>Samples</th>
+          <th>PDOA</th>
+          <th>Range</th>
+          <th>Stddev</th>
+          <th>Verify</th>
+          <th>Updated</th>
+          <th>Error</th>
+        </tr>
+      </thead>
+      <tbody id="cal-tbody"></tbody>
+    </table>
+  </section>
+
   <!-- TWR Debug Tab -->
   <section id="tab-twr-debug" class="tab">
     <h2>TWR Debug</h2>
@@ -99,6 +147,7 @@
           <th>Y (cm)</th>
           <th>Range</th>
           <th>Flags</th>
+          <th>PDOA</th>
           <th>Escort</th>
           <th>Decision</th>
           <th>Sent</th>

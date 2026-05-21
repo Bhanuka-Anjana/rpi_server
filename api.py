@@ -87,6 +87,11 @@ async def get_anchors():
     return db.get_all_anchors()
 
 
+@app.get("/api/calibrations")
+async def get_calibrations():
+    return db.get_all_anchor_calibrations()
+
+
 @app.get("/api/rooms")
 async def get_rooms():
     return db.get_rooms()
@@ -174,6 +179,27 @@ async def remove_anchor(anchor_id: int):
     broadcast_event({"type": "_anchor_removed", "anchor_id": anchor_id,
                      "anchor_id_str": str(anchor_id)})
     return {"status": "removed", "anchor_id": anchor_id}
+
+
+@app.get("/api/anchor/{anchor_id}/calibration")
+async def get_anchor_calibration(anchor_id: int):
+    row = db.get_anchor_calibration(anchor_id)
+    if row:
+        return row
+    return {"anchor_id": anchor_id, "anchor_id_str": str(anchor_id), "status": "IDLE"}
+
+
+@app.post("/api/anchor/{anchor_id}/calibration/start")
+async def start_anchor_calibration(anchor_id: int, request: Request):
+    try:
+        return await tcp_server.start_anchor_calibration(anchor_id, await request.json())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/anchor/{anchor_id}/calibration/abort")
+async def abort_anchor_calibration(anchor_id: int):
+    return await tcp_server.abort_anchor_calibration(anchor_id)
 
 
 @app.post("/api/firmware")
@@ -282,6 +308,7 @@ async def event_stream():
                 "tags": db.get_all_tags(),
                 "anchors": db.get_all_anchors(),
                 "rooms": db.get_rooms(),
+                "calibrations": db.get_all_anchor_calibrations(),
             }
             yield f"data: {json.dumps(snapshot)}\n\n"
 

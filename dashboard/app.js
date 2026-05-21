@@ -129,6 +129,7 @@ let events       = [];   // recent events (capped at 200)
 let alerts       = [];   // alert events
 let firmwareList = [];   // [{id, version, filename, size_bytes, sha256, uploaded_ms}]
 let twrDebug     = [];   // recent raw TWR samples shown in the debug tab
+let calibrations = {};   // anchor_id -> latest calibration row
 let selectedRoomId = null;
 let selectedRoomAnchorId = null;
 let placingAnchorId = null;
@@ -345,14 +346,82 @@ function renderTwrDebug() {
       <td>${e.x_cm ?? "-"}</td>
       <td>${e.y_cm ?? "-"}</td>
       <td>${e.range_num ?? "-"}</td>
-      <td>${hex8(e.flags)}</td>
+      <td>${e.flags16 !== undefined ? hex16(e.flags16) : hex8(e.flags)}</td>
+      <td>${e.pdoa_deg !== undefined && e.pdoa_deg !== null ? Number(e.pdoa_deg).toFixed(2) : "-"}</td>
       <td>${boolLabel(e.escort)}</td>
       <td><span class="pill ${decisionClass}">${decision}</span></td>
       <td><span class="pill ${sentClass}">${sentText}</span></td>
       <td class="raw-cell">${e.raw_hex || "-"}</td>
     </tr>
   `;
-  }).join("") || '<tr><td colspan="13" style="color:#6b7280">No TWR samples</td></tr>';
+  }).join("") || '<tr><td colspan="14" style="color:#6b7280">No TWR samples</td></tr>';
+}
+
+function calibrationKey(row) {
+  return row?.anchor_id_str || (row?.anchor_id !== undefined ? String(row.anchor_id) : undefined);
+}
+
+function statusPill(status) {
+  const s = status || "IDLE";
+  const cls = s === "CALIBRATED" ? "cal-ok" :
+              s === "FAILED" || s === "ABORTED" ? "cal-fail" :
+              ["STARTING", "CLEARING", "WARMUP", "COLLECTING", "APPLYING", "VERIFYING"].includes(s) ? "cal-run" :
+              "cal-idle";
+  return `<span class="pill ${cls}">${esc(s)}</span>`;
+}
+
+function fmtNum(value, digits = 3, suffix = "") {
+  if (value === undefined || value === null || value === "") return "-";
+  const n = Number(value);
+  return Number.isFinite(n) ? `${n.toFixed(digits)}${suffix}` : String(value);
+}
+
+function renderCalibrationControls() {
+  const anchorSel = document.getElementById("cal-anchor-select");
+  const tagSel = document.getElementById("cal-tag-select");
+  if (!anchorSel || !tagSel) return;
+  const selectedAnchor = anchorSel.value;
+  const selectedTag = tagSel.value;
+  const anchorRows = Object.values(anchors).sort((a, b) => anchorLabel(a).localeCompare(anchorLabel(b)));
+  anchorSel.innerHTML = anchorRows.map(a => {
+    const id = anchorKey(a);
+    return `<option value="${id}">${esc(anchorLabel(a))}</option>`;
+  }).join("");
+  if (selectedAnchor && anchorRows.some(a => anchorKey(a) === selectedAnchor)) anchorSel.value = selectedAnchor;
+
+  const tagRows = Object.values(tags).sort((a, b) => Number(a.uid) - Number(b.uid));
+  tagSel.innerHTML = tagRows.map(t => `<option value="${t.uid}">0x${Number(t.uid).toString(16).toUpperCase().padStart(4, "0")}</option>`).join("");
+  if (selectedTag && tagRows.some(t => String(t.uid) === selectedTag)) tagSel.value = selectedTag;
+}
+
+function renderCalibration() {
+  renderCalibrationControls();
+  const tbody = document.getElementById("cal-tbody");
+  if (!tbody) return;
+  const keys = new Set([...Object.keys(anchors), ...Object.keys(calibrations)]);
+  const rows = [...keys].map(id => calibrations[id] || { anchor_id_str: id, status: "IDLE" })
+    .sort((a, b) => anchorDisplayById(calibrationKey(a)).localeCompare(anchorDisplayById(calibrationKey(b))));
+
+  tbody.innerHTML = rows.map(c => {
+    const id = calibrationKey(c);
+    const samples = `${c.ignored_samples ?? 0}/${c.collected_samples ?? 0}/${c.verify_samples ?? 0}`;
+    const tag = c.tag_uid !== undefined && c.tag_uid !== null
+      ? `0x${Number(c.tag_uid).toString(16).toUpperCase().padStart(4, "0")}` : "-";
+    return `
+    <tr>
+      <td>${esc(anchorDisplayById(id))}</td>
+      <td>${statusPill(c.status)}</td>
+      <td>${tag}</td>
+      <td>${fmtNum(c.measured_distance_m, 3, " m")}</td>
+      <td>${samples}</td>
+      <td>${c.pdoa_deg ?? "-"}${c.phase_correction_rad !== undefined && c.phase_correction_rad !== null ? ` / ${fmtNum(c.phase_correction_rad, 4, " rad")}` : ""}</td>
+      <td>${c.rng_mm ?? "-"}${c.range_correction_m !== undefined && c.range_correction_m !== null ? ` / ${fmtNum(c.range_correction_m, 4, " m")}` : ""}</td>
+      <td>${fmtNum(c.phase_stddev_deg, 2, " deg")} / ${fmtNum(c.range_stddev_m, 3, " m")}</td>
+      <td>${fmtNum(c.verify_phase_mean_deg, 2, " deg")} / ${fmtNum(c.verify_range_error_m, 3, " m")}</td>
+      <td>${elapsed(c.updated_ms)}</td>
+      <td class="cal-error">${esc(c.last_error || "")}</td>
+    </tr>`;
+  }).join("") || '<tr><td colspan="11" style="color:#6b7280">No anchors registered</td></tr>';
 }
 
 function renderRoomMapOnly() {
@@ -607,6 +676,7 @@ function renderAll() {
   renderDoors();
   renderRooms();
   renderAlerts();
+  renderCalibration();
   renderTwrDebug();
   renderEvents();
   renderFirmware();
@@ -628,6 +698,51 @@ document.getElementById("room-admin").addEventListener("input", e => {
 document.getElementById("twr-clear-btn").addEventListener("click", () => {
   twrDebug = [];
   renderTwrDebug();
+});
+
+document.getElementById("cal-start-btn").addEventListener("click", () => {
+  const anchorId = document.getElementById("cal-anchor-select").value;
+  const tagUid = document.getElementById("cal-tag-select").value;
+  const distance = Number(document.getElementById("cal-distance-input").value);
+  const status = document.getElementById("cal-status-msg");
+  if (!anchorId) { alert("Select an anchor first."); return; }
+  if (!tagUid) { alert("Select a tag first."); return; }
+  if (!Number.isFinite(distance) || distance <= 0) { alert("Enter measured distance in meters."); return; }
+  const body = {
+    tag_uid: Number(tagUid),
+    measured_distance_m: distance,
+    ignore_n: Number(document.getElementById("cal-ignore-input").value || 200),
+    collect_n: Number(document.getElementById("cal-collect-input").value || 200),
+    verify_collect_n: Number(document.getElementById("cal-verify-input").value || 50),
+    sample_timeout_s: Number(document.getElementById("cal-timeout-input").value || 120),
+  };
+  status.textContent = "Starting calibration...";
+  fetch(`/api/anchor/${anchorId}/calibration/start`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body),
+  }).then(async r => {
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || "Calibration start failed");
+    const id = calibrationKey(data);
+    calibrations[id] = data;
+    status.textContent = `Calibration ${data.status}`;
+    scheduleRender();
+  }).catch(err => { status.textContent = err.message; });
+});
+
+document.getElementById("cal-abort-btn").addEventListener("click", () => {
+  const anchorId = document.getElementById("cal-anchor-select").value;
+  const status = document.getElementById("cal-status-msg");
+  if (!anchorId) return;
+  fetch(`/api/anchor/${anchorId}/calibration/abort`, { method: "POST" })
+    .then(r => r.json())
+    .then(data => {
+      const id = calibrationKey(data);
+      calibrations[id] = data;
+      status.textContent = `Calibration ${data.status || "aborted"}`;
+      scheduleRender();
+    });
 });
 
 function roomMapPoint(evt) {
@@ -972,6 +1087,7 @@ function connect() {
       msg.tags.forEach(t    => { tags[t.uid]           = t; });
       msg.anchors.forEach(a => { storeAnchor(a); });
       rooms = msg.rooms || [];
+      (msg.calibrations || []).forEach(c => { calibrations[calibrationKey(c)] = c; });
       selectedRoomId = rooms[0]?.id || selectedRoomId;
       renderAll();
       return;
@@ -993,6 +1109,13 @@ function connect() {
     if (msg.type === "_config_update") {
       const id = anchorKey(msg);
       if (anchors[id]) Object.assign(anchors[id], msg);
+      scheduleRender();
+      return;
+    }
+
+    if (msg.type === "_calibration_update") {
+      const id = calibrationKey(msg);
+      if (id !== undefined) calibrations[id] = msg;
       scheduleRender();
       return;
     }
@@ -1112,13 +1235,15 @@ Promise.all([
   fetchWithTimeout("/api/alerts?limit=50"),
   fetchWithTimeout("/api/firmware"),
   fetchWithTimeout("/api/rooms"),
-]).then(([t, a, ev, al, fw, roomList]) => {
+  fetchWithTimeout("/api/calibrations"),
+]).then(([t, a, ev, al, fw, roomList, calList]) => {
   t.forEach(tag   => { tags[tag.uid]            = tag; });
   a.forEach(anch  => { storeAnchor(anch); });
   events = ev;
   alerts = al;
   firmwareList = fw;
   rooms = roomList || [];
+  (calList || []).forEach(c => { calibrations[calibrationKey(c)] = c; });
   selectedRoomId = rooms[0]?.id || null;
   renderAll();
   connect();

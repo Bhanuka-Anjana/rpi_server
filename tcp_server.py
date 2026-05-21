@@ -14,12 +14,14 @@
 # Provision new anchor:   python3 pki/provision_anchor.py --id <N>
 
 import asyncio
+import csv
 import json
 import logging
 import math
 import ssl
 import threading
 import time
+from pathlib import Path
 
 import database as db
 import pki_utils
@@ -62,14 +64,34 @@ _anchor_twr_tags: dict[int, dict[int, dict]] = {}
 _anchor_twr_expiry_tasks: dict[int, asyncio.Task] = {}
 
 _RAW_TWR_START = 0xAA
+_RAW_TWR_EXT_START = 0xAE
 _RAW_TWR_END = 0x55
 _RAW_TWR_FRAME_LEN = 15
+_RAW_TWR_EXT_FRAME_LEN = 20
 
 # Rate-limit tag_state DB writes — SSE delivers real-time position, DB only needs
 # a fresh snapshot for page reloads. Write at most once per _TAG_DB_INTERVAL seconds.
 _tag_db_lock    = threading.Lock()
 _tag_last_write: dict[int, float] = {}
 _TAG_DB_INTERVAL = 0.25   # seconds — 4 writes/sec per tag maximum
+
+
+_CALIBRATION_LOG_DIR = Path(__file__).parent / "calibration_logs"
+_CALIBRATION_DEFAULTS = {
+    "ignore_n": 200,
+    "collect_n": 200,
+    "verify_collect_n": 50,
+    "sample_timeout_s": 120.0,
+    "phase_stddev_max_deg": 10.0,
+    "range_stddev_max_m": 0.15,
+    "verify_phase_max_deg": 3.0,
+    "verify_range_max_m": 0.10,
+}
+_calibration_runs: dict[int, dict] = {}
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
 
 
 def _parse_eui64(value, *, hex_if_16: bool = False) -> int | None:
@@ -214,6 +236,51 @@ def _decode_raw_twr_frame(frame: bytes) -> dict | None:
     }
 
 
+def _decode_extended_twr_frame(frame: bytes) -> dict | None:
+    """Decode the extended binary UART TWR frame used by calibration."""
+    if len(frame) != _RAW_TWR_EXT_FRAME_LEN:
+        return None
+    if frame[0] != _RAW_TWR_EXT_START or frame[19] != _RAW_TWR_END:
+        return None
+
+    checksum = 0
+    for b in frame[1:18]:
+        checksum ^= b
+    if checksum != frame[18]:
+        log.warning("[TCP] Dropped extended TWR frame: checksum calc=0x%02X rx=0x%02X",
+                    checksum, frame[18])
+        return None
+
+    tag_uid = frame[1] | (frame[2] << 8)
+    anchor_short_id = frame[3] | (frame[4] << 8)
+    dist_mm = int.from_bytes(frame[5:9], byteorder="little", signed=False)
+    range_num = frame[9]
+    flags16 = frame[10] | (frame[11] << 8)
+    x_cm = int.from_bytes(frame[12:14], byteorder="little", signed=True)
+    y_cm = int.from_bytes(frame[14:16], byteorder="little", signed=True)
+    pdoa_cdeg = int.from_bytes(frame[16:18], byteorder="little", signed=True)
+    dist_cm = int(round(dist_mm / 10.0))
+
+    return {
+        "type": "EVT_TWR_SAMPLE",
+        "tag_uid": tag_uid,
+        "anchor_short_id": anchor_short_id,
+        "dist_cm": dist_cm,
+        "dist_m": dist_mm / 1000.0,
+        "range_num": range_num,
+        "flags": flags16 & 0xFF,
+        "flags16": flags16,
+        "x_cm": x_cm,
+        "y_cm": y_cm,
+        "pdoa_cdeg": pdoa_cdeg,
+        "pdoa_deg": pdoa_cdeg / 100.0,
+        "checksum": frame[18],
+        "escort": 1 if (flags16 & 0x01) else 0,
+        "raw_hex": frame.hex().upper(),
+        "raw_format": "extended",
+    }
+
+
 def _build_ssl_context() -> ssl.SSLContext:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(SERVER_CERT_PATH, SERVER_KEY_PATH)
@@ -306,6 +373,350 @@ async def push_command(anchor_id: int, cmd: dict):
         log.info("[TCP] Command %s pushed to anchor %d", cmd.get("type"), anchor_id)
     except Exception as e:
         log.warning("[TCP] Command push failed for anchor %d: %s", anchor_id, e)
+
+
+def format_six_char_signed(value: int) -> str:
+    """Return node offset field: 6 chars, zero padded, sign only if negative."""
+    value = int(value)
+    if value < 0:
+        if value < -99999:
+            raise ValueError("negative offset does not fit signed 6-char field")
+        return f"-{abs(value):05d}"
+    if value > 999999:
+        raise ValueError("positive offset does not fit 6-char field")
+    return f"{value:06d}"
+
+
+def _stddev(values: list[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    mean = sum(values) / len(values)
+    return math.sqrt(sum((v - mean) ** 2 for v in values) / (len(values) - 1))
+
+
+def compute_calibration_offsets(phase_rad_samples: list[float],
+                                range_error_samples: list[float]) -> dict:
+    if not phase_rad_samples or not range_error_samples:
+        raise ValueError("calibration sample lists must not be empty")
+    if len(phase_rad_samples) != len(range_error_samples):
+        raise ValueError("phase and range sample counts must match")
+    phase_mean = sum(phase_rad_samples) / len(phase_rad_samples)
+    range_mean = sum(range_error_samples) / len(range_error_samples)
+    return {
+        "phase_correction_rad": phase_mean,
+        "range_correction_m": range_mean,
+        "pdoa_deg": int(round(phase_mean * 180.0 / math.pi)),
+        "rng_mm": int(round(range_mean * 1000.0)),
+        "phase_stddev_deg": _stddev([v * 180.0 / math.pi for v in phase_rad_samples]),
+        "range_stddev_m": _stddev(range_error_samples),
+    }
+
+
+async def _push_calibration_uart(anchor_id: int, command: str) -> bool:
+    writer = _anchor_writers.get(anchor_id)
+    if not writer:
+        log.warning("[TCP] Calibration command failed - anchor %d not connected", anchor_id)
+        return False
+    payload = {"type": "CALIB_UART", "anchor_id": anchor_id, "command": command}
+    try:
+        writer.write((json.dumps(payload) + "\n").encode())
+        await writer.drain()
+        log.info("[TCP] Calibration UART command pushed to anchor %d: %r",
+                 anchor_id, command)
+        return True
+    except Exception as e:
+        log.warning("[TCP] Calibration command failed for anchor %d: %s", anchor_id, e)
+        return False
+
+
+def _calibration_public_state(anchor_id: int, state: dict) -> dict:
+    fields = {
+        k: v for k, v in state.items()
+        if k not in ("queue", "task", "phase_samples", "range_samples", "csv_file")
+    }
+    fields["anchor_id"] = anchor_id
+    fields["anchor_id_str"] = str(anchor_id)
+    fields.setdefault("type", "_calibration_update")
+    return fields
+
+
+def _persist_and_broadcast_calibration(anchor_id: int, state: dict):
+    public = _calibration_public_state(anchor_id, state)
+    saved = db.upsert_anchor_calibration(anchor_id, {
+        k: v for k, v in public.items()
+        if k not in ("type", "anchor_id", "anchor_id_str")
+    })
+    saved["type"] = "_calibration_update"
+    if _broadcast_fn:
+        _broadcast_fn(saved)
+    return saved
+
+
+def _update_calibration(anchor_id: int, state: dict, **fields) -> dict:
+    state.update(fields)
+    state["updated_ms"] = _now_ms()
+    return _persist_and_broadcast_calibration(anchor_id, state)
+
+
+async def start_anchor_calibration(anchor_id: int, params: dict) -> dict:
+    if anchor_id not in _anchor_writers:
+        raise ValueError("anchor not connected")
+
+    active = _calibration_runs.get(anchor_id)
+    if active and active.get("task") and not active["task"].done():
+        raise ValueError("calibration already running for anchor")
+
+    try:
+        tag_uid = int(params["tag_uid"])
+        measured_distance_m = float(params["measured_distance_m"])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("tag_uid and measured_distance_m are required")
+    if tag_uid < 0 or tag_uid > 0xFFFF:
+        raise ValueError("tag_uid must fit 16 bits")
+    if measured_distance_m <= 0:
+        raise ValueError("measured_distance_m must be positive")
+
+    cfg = dict(_CALIBRATION_DEFAULTS)
+    for key in cfg:
+        if key in params and params[key] not in (None, ""):
+            cfg[key] = float(params[key]) if key.endswith("_s") or key.endswith("_m") or key.endswith("_deg") else int(params[key])
+    cfg["ignore_n"] = max(0, int(cfg["ignore_n"]))
+    cfg["collect_n"] = max(1, int(cfg["collect_n"]))
+    cfg["verify_collect_n"] = max(1, int(cfg["verify_collect_n"]))
+    cfg["sample_timeout_s"] = max(5.0, float(cfg["sample_timeout_s"]))
+
+    started_ms = _now_ms()
+    _CALIBRATION_LOG_DIR.mkdir(exist_ok=True)
+    log_path = _CALIBRATION_LOG_DIR / f"anchor_{anchor_id}_tag_{tag_uid}_{started_ms}.csv"
+
+    state = {
+        "status": "STARTING",
+        "tag_uid": tag_uid,
+        "measured_distance_m": measured_distance_m,
+        "ignore_n": cfg["ignore_n"],
+        "collect_n": cfg["collect_n"],
+        "verify_collect_n": cfg["verify_collect_n"],
+        "sample_timeout_s": cfg["sample_timeout_s"],
+        "phase_stddev_max_deg": cfg["phase_stddev_max_deg"],
+        "range_stddev_max_m": cfg["range_stddev_max_m"],
+        "verify_phase_max_deg": cfg["verify_phase_max_deg"],
+        "verify_range_max_m": cfg["verify_range_max_m"],
+        "ignored_samples": 0,
+        "collected_samples": 0,
+        "verify_samples": 0,
+        "last_error": None,
+        "log_path": str(log_path),
+        "started_ms": started_ms,
+        "updated_ms": started_ms,
+        "completed_ms": None,
+        "queue": asyncio.Queue(maxsize=1000),
+    }
+    task = asyncio.create_task(_calibration_worker(anchor_id, state))
+    state["task"] = task
+    _calibration_runs[anchor_id] = state
+    return _persist_and_broadcast_calibration(anchor_id, state)
+
+
+async def abort_anchor_calibration(anchor_id: int) -> dict:
+    state = _calibration_runs.get(anchor_id)
+    if not state or not state.get("task") or state["task"].done():
+        row = db.get_anchor_calibration(anchor_id)
+        if row:
+            return row
+        return db.upsert_anchor_calibration(anchor_id, {
+            "status": "IDLE",
+            "updated_ms": _now_ms(),
+        })
+    state["task"].cancel()
+    _update_calibration(anchor_id, state, status="ABORTED", completed_ms=_now_ms(),
+                        last_error="aborted by operator")
+    return db.get_anchor_calibration(anchor_id)
+
+
+def _calibration_accept_sample(anchor_id: int, evt: dict):
+    state = _calibration_runs.get(anchor_id)
+    if not state or not state.get("task") or state["task"].done():
+        return
+    if evt.get("type") != "EVT_TWR_SAMPLE":
+        return
+    if int(evt.get("tag_uid", -1)) != int(state.get("tag_uid", -2)):
+        return
+    q: asyncio.Queue = state["queue"]
+    try:
+        q.put_nowait(evt.copy())
+    except asyncio.QueueFull:
+        try:
+            q.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        try:
+            q.put_nowait(evt.copy())
+        except asyncio.QueueFull:
+            pass
+
+
+def _calibration_sample_values(evt: dict, measured_distance_m: float) -> tuple[float, float]:
+    if evt.get("pdoa_deg") is None or evt.get("flags16") is None or evt.get("dist_m") is None:
+        raise ValueError("extended TWR report with dist_m, pdoa_deg, and flags16 is required")
+    flags16 = int(evt["flags16"])
+    if (flags16 & 0xC000) != 0xC000:
+        raise ValueError("node did not report cleared offsets during raw collection")
+    pdoa_deg = float(evt["pdoa_deg"])
+    dist_m = float(evt["dist_m"])
+    return pdoa_deg * math.pi / 180.0, dist_m - measured_distance_m
+
+
+async def _wait_calibration_sample(state: dict, deadline: float) -> dict:
+    timeout = deadline - asyncio.get_running_loop().time()
+    if timeout <= 0:
+        raise TimeoutError("insufficient samples before timeout")
+    return await asyncio.wait_for(state["queue"].get(), timeout=timeout)
+
+
+def _write_calibration_csv(writer, stage: str, evt: dict, range_error_m=None):
+    writer.writerow([
+        stage,
+        evt.get("ts_ms"),
+        evt.get("tag_uid"),
+        evt.get("range_num"),
+        evt.get("dist_m"),
+        evt.get("dist_cm"),
+        evt.get("pdoa_deg"),
+        evt.get("flags16"),
+        range_error_m,
+        evt.get("raw_hex"),
+    ])
+
+
+async def _calibration_worker(anchor_id: int, state: dict):
+    csv_file = None
+    try:
+        csv_file = open(state["log_path"], "w", newline="", buffering=1)
+        writer = csv.writer(csv_file)
+        writer.writerow([
+            "stage", "ts_ms", "tag_uid", "range_num", "dist_m", "dist_cm",
+            "pdoa_deg", "flags16", "range_error_m", "raw_hex",
+        ])
+
+        _update_calibration(anchor_id, state, status="CLEARING")
+        for command in ("pdoaoff 000000\r\n", "rngoff 000000\r\n"):
+            if not await _push_calibration_uart(anchor_id, command):
+                raise RuntimeError("failed to send clear offset command")
+        await asyncio.sleep(0.25)
+        while True:
+            try:
+                state["queue"].get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+        deadline = asyncio.get_running_loop().time() + float(state["sample_timeout_s"])
+        phase_samples: list[float] = []
+        range_samples: list[float] = []
+        seen = 0
+        _update_calibration(anchor_id, state, status="WARMUP")
+
+        while len(range_samples) < int(state["collect_n"]):
+            evt = await _wait_calibration_sample(state, deadline)
+            phase_rad, range_error_m = _calibration_sample_values(
+                evt, float(state["measured_distance_m"])
+            )
+            seen += 1
+            if seen <= int(state["ignore_n"]):
+                state["ignored_samples"] = seen
+                _write_calibration_csv(writer, "ignore", evt, range_error_m)
+                if seen % 10 == 0 or seen == int(state["ignore_n"]):
+                    _update_calibration(anchor_id, state, ignored_samples=seen)
+                continue
+
+            if state["status"] != "COLLECTING":
+                _update_calibration(anchor_id, state, status="COLLECTING")
+            phase_samples.append(phase_rad)
+            range_samples.append(range_error_m)
+            state["collected_samples"] = len(range_samples)
+            _write_calibration_csv(writer, "collect", evt, range_error_m)
+            if len(range_samples) % 10 == 0 or len(range_samples) == int(state["collect_n"]):
+                _update_calibration(anchor_id, state, collected_samples=len(range_samples))
+
+        result = compute_calibration_offsets(phase_samples, range_samples)
+        phase_mean = result["phase_correction_rad"]
+        range_mean = result["range_correction_m"]
+        phase_stddev_deg = result["phase_stddev_deg"]
+        range_stddev_m = result["range_stddev_m"]
+        pdoa_degrees = result["pdoa_deg"]
+        rng_mm = result["rng_mm"]
+        pdoa_field = format_six_char_signed(pdoa_degrees)
+        rng_field = format_six_char_signed(rng_mm)
+
+        _update_calibration(
+            anchor_id, state, status="APPLYING",
+            phase_correction_rad=phase_mean,
+            range_correction_m=range_mean,
+            pdoa_deg=pdoa_degrees,
+            rng_mm=rng_mm,
+            phase_stddev_deg=phase_stddev_deg,
+            range_stddev_m=range_stddev_m,
+        )
+
+        if phase_stddev_deg > float(state["phase_stddev_max_deg"]):
+            raise RuntimeError(f"phase stddev too high: {phase_stddev_deg:.3f} deg")
+        if range_stddev_m > float(state["range_stddev_max_m"]):
+            raise RuntimeError(f"range stddev too high: {range_stddev_m:.3f} m")
+
+        for command in (
+            f"pdoaoff {pdoa_field}\r\n",
+            f"rngoff {rng_field}\r\n",
+            "save\r\n",
+            "stat\n",
+        ):
+            if not await _push_calibration_uart(anchor_id, command):
+                raise RuntimeError("failed to send apply/save command")
+            await asyncio.sleep(0.05)
+
+        _update_calibration(anchor_id, state, status="VERIFYING")
+        while True:
+            try:
+                state["queue"].get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        verify_phase_deg: list[float] = []
+        verify_range_err: list[float] = []
+        deadline = asyncio.get_running_loop().time() + float(state["sample_timeout_s"])
+        while len(verify_range_err) < int(state["verify_collect_n"]):
+            evt = await _wait_calibration_sample(state, deadline)
+            if evt.get("pdoa_deg") is None or evt.get("dist_m") is None:
+                raise ValueError("extended TWR report is required for verification")
+            pdoa_deg = float(evt["pdoa_deg"])
+            range_error_m = float(evt["dist_m"]) - float(state["measured_distance_m"])
+            verify_phase_deg.append(pdoa_deg)
+            verify_range_err.append(range_error_m)
+            state["verify_samples"] = len(verify_range_err)
+            _write_calibration_csv(writer, "verify", evt, range_error_m)
+            if len(verify_range_err) % 10 == 0 or len(verify_range_err) == int(state["verify_collect_n"]):
+                _update_calibration(anchor_id, state, verify_samples=len(verify_range_err))
+
+        verify_phase_mean_deg = sum(verify_phase_deg) / len(verify_phase_deg)
+        verify_range_error_m = sum(verify_range_err) / len(verify_range_err)
+        if abs(verify_phase_mean_deg) > float(state["verify_phase_max_deg"]):
+            raise RuntimeError(f"verification PDOA residual too high: {verify_phase_mean_deg:.3f} deg")
+        if abs(verify_range_error_m) > float(state["verify_range_max_m"]):
+            raise RuntimeError(f"verification range residual too high: {verify_range_error_m:.3f} m")
+
+        _update_calibration(
+            anchor_id, state, status="CALIBRATED",
+            verify_phase_mean_deg=verify_phase_mean_deg,
+            verify_range_error_m=verify_range_error_m,
+            completed_ms=_now_ms(),
+            last_error=None,
+        )
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        log.warning("[TCP] Calibration failed for anchor %d: %s", anchor_id, e)
+        _update_calibration(anchor_id, state, status="FAILED",
+                            last_error=str(e), completed_ms=_now_ms())
+    finally:
+        if csv_file:
+            csv_file.close()
 
 
 async def _push_lock_state(anchor_id: int, locked: bool, evt: dict):
@@ -811,22 +1222,26 @@ async def _handle_anchor(reader: asyncio.StreamReader,
 
             buffer += chunk
             while buffer:
-                if buffer[0] == _RAW_TWR_START:
-                    if len(buffer) < _RAW_TWR_FRAME_LEN:
+                if buffer[0] in (_RAW_TWR_START, _RAW_TWR_EXT_START):
+                    frame_len = _RAW_TWR_EXT_FRAME_LEN if buffer[0] == _RAW_TWR_EXT_START else _RAW_TWR_FRAME_LEN
+                    if len(buffer) < frame_len:
                         break
-                    frame, buffer = buffer[:_RAW_TWR_FRAME_LEN], buffer[_RAW_TWR_FRAME_LEN:]
+                    frame, buffer = buffer[:frame_len], buffer[frame_len:]
                     if bootstrap_pending:
                         log.debug("[TCP] Dropped raw TWR frame from bootstrap peer before HELLO")
                         continue
-                    evt = _decode_raw_twr_frame(frame)
+                    evt = (_decode_extended_twr_frame(frame)
+                           if frame[0] == _RAW_TWR_EXT_START
+                           else _decode_raw_twr_frame(frame))
                     if evt is None:
                         continue
                     etype = evt.get("type", "")
-                    evt["ts_ms"] = int(time.time() * 1000)
+                    evt["ts_ms"] = _now_ms()
                     evt["anchor_id"] = anchor_id_cert
                     evt["anchor_id_str"] = str(anchor_id_cert)
 
                     await _apply_twr_lock_decision(anchor_id_cert, evt)
+                    _calibration_accept_sample(anchor_id_cert, evt)
 
                     if _broadcast_fn:
                         _broadcast_fn(evt)
@@ -930,6 +1345,7 @@ async def _handle_anchor(reader: asyncio.StreamReader,
 
                     # Server-side door decision for immediate TWR samples.
                     await _apply_twr_lock_decision(anchor_id_cert, evt)
+                    _calibration_accept_sample(anchor_id_cert, evt)
 
                     # ── CONFIG_ACK — DB first, then broadcast result ────────
                     if etype == "CONFIG_ACK":
