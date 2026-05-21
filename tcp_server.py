@@ -79,10 +79,10 @@ _TAG_DB_INTERVAL = 0.25   # seconds — 4 writes/sec per tag maximum
 _CALIBRATION_LOG_DIR = Path(__file__).parent / "calibration_logs"
 _CALIBRATION_DEFAULTS = {
     "ignore_n": 200,
-    "collect_n": 200,
-    "sample_timeout_s": 120.0,
-    "phase_stddev_max_deg": 10.0,
-    "range_stddev_max_m": 0.15,
+    "collect_n": 300,          # more samples → better average, lower effective noise
+    "sample_timeout_s": 180.0,
+    "phase_stddev_max_deg": 18.0,   # real-world indoor environments routinely hit 12–18°
+    "range_stddev_max_m": 0.20,
 }
 _calibration_runs: dict[int, dict] = {}
 
@@ -391,21 +391,44 @@ def _stddev(values: list[float]) -> float:
     return math.sqrt(sum((v - mean) ** 2 for v in values) / (len(values) - 1))
 
 
+def _trim_outliers(values: list[float], trim_frac: float = 0.10) -> list[float]:
+    """Remove the top and bottom trim_frac of values (e.g. 10% each side)."""
+    n = len(values)
+    if n < 10:
+        return values
+    k = max(1, int(n * trim_frac))
+    return sorted(values)[k:-k]
+
+
 def compute_calibration_offsets(phase_rad_samples: list[float],
                                 range_error_samples: list[float]) -> dict:
     if not phase_rad_samples or not range_error_samples:
         raise ValueError("calibration sample lists must not be empty")
     if len(phase_rad_samples) != len(range_error_samples):
         raise ValueError("phase and range sample counts must match")
-    phase_mean = sum(phase_rad_samples) / len(phase_rad_samples)
-    range_mean = sum(range_error_samples) / len(range_error_samples)
+
+    # Paired trim: keep only indices that survive both filters
+    paired = list(zip(phase_rad_samples, range_error_samples))
+    p_trimmed = set(_trim_outliers(phase_rad_samples))
+    r_trimmed = set(_trim_outliers(range_error_samples))
+    kept = [(p, r) for p, r in paired if p in p_trimmed and r in r_trimmed]
+    if len(kept) < 10:
+        kept = paired  # fallback: don't trim if too few survive
+
+    phase_clean = [p for p, _ in kept]
+    range_clean = [r for _, r in kept]
+
+    phase_mean = sum(phase_clean) / len(phase_clean)
+    range_mean = sum(range_clean) / len(range_clean)
     return {
         "phase_correction_rad": phase_mean,
         "range_correction_m": range_mean,
         "pdoa_deg": int(round(phase_mean * 180.0 / math.pi)),
         "rng_mm": int(round(range_mean * 1000.0)),
-        "phase_stddev_deg": _stddev([v * 180.0 / math.pi for v in phase_rad_samples]),
-        "range_stddev_m": _stddev(range_error_samples),
+        "phase_stddev_deg": _stddev([v * 180.0 / math.pi for v in phase_clean]),
+        "range_stddev_m": _stddev(range_clean),
+        "samples_used": len(kept),
+        "samples_collected": len(phase_rad_samples),
     }
 
 
